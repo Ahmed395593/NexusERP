@@ -37,6 +37,12 @@ interface PartRow {
     contractDuration?: string;
     contractStartDate?: string;
     scopeOfWork?: string;
+    cancellationReason?: string;
+    revertReason?: string;
+    lastAction?: string;
+    lastActionComment?: string;
+    cancelledPoNumber?: string;
+    revertedPoNumber?: string;
 }
 
 type ColKey = keyof Pick<PartRow, 'internalPN' | 'mfrPN' | 'description' | 'qty' | 'purchaseDate' | 'usageDate' | 'price' | 'supplier'>;
@@ -62,6 +68,7 @@ const STATUS_COLORS: Record<string, string> = {
     'MANUFACTURED': 'bg-teal-100 text-teal-700',
     'RESERVED': 'bg-cyan-100 text-cyan-700',
     'CANCELLED': 'bg-rose-100 text-rose-600',
+    'REVERTED_TO_AWARD': 'bg-amber-100 text-amber-800 border border-amber-300 font-black',
 };
 
 export const PartHistory: React.FC<PartHistoryProps> = ({ orders, suppliers }) => {
@@ -92,6 +99,13 @@ export const PartHistory: React.FC<PartHistoryProps> = ({ orders, suppliers }) =
                         usageDate = comp.statusUpdatedAt || '';
                     }
 
+                    let partStatus = comp.status || '';
+                    if (comp.lastAction === 'CANCELLED' || (comp.cancellationReason && comp.status === 'PENDING_OFFER')) {
+                        partStatus = 'CANCELLED';
+                    } else if (comp.lastAction === 'REVERTED_TO_AWARD' || (comp.revertReason && comp.status === 'AWARDED')) {
+                        partStatus = 'REVERTED_TO_AWARD';
+                    }
+
                     rows.push({
                         id: comp.id || `${order.id}-${item.id}-${comp.description}`,
                         internalPN: comp.componentNumber || '',
@@ -107,7 +121,13 @@ export const PartHistory: React.FC<PartHistoryProps> = ({ orders, suppliers }) =
                         // Detail fields
                         customerName: order.customerName || '',
                         poNumber: comp.poNumber || '',
-                        status: comp.status || '',
+                        status: partStatus,
+                        cancellationReason: comp.cancellationReason,
+                        revertReason: comp.revertReason,
+                        lastAction: comp.lastAction,
+                        lastActionComment: comp.lastActionComment,
+                        cancelledPoNumber: comp.cancelledPoNumber,
+                        revertedPoNumber: comp.revertedPoNumber,
                         itemDescription: item.description || '',
                         rfpId: comp.rfpId || '',
                         awardId: comp.awardId || '',
@@ -122,7 +142,9 @@ export const PartHistory: React.FC<PartHistoryProps> = ({ orders, suppliers }) =
                             (l.message || '').toLowerCase().includes('component') ||
                             (l.message || '').toLowerCase().includes('rfp') ||
                             (l.message || '').toLowerCase().includes('award') ||
-                            (l.message || '').toLowerCase().includes('po ')
+                            (l.message || '').toLowerCase().includes('po ') ||
+                            (l.message || '').toLowerCase().includes('cancel') ||
+                            (l.message || '').toLowerCase().includes('revert')
                         ),
                         replacementHistory: comp.replacementHistory || [],
                         contractNumber: comp.contractNumber || '',
@@ -228,6 +250,16 @@ export const PartHistory: React.FC<PartHistoryProps> = ({ orders, suppliers }) =
             case 'usageDate': return formatDate(row.usageDate);
             case 'internalPN': return <span className="font-mono text-blue-600">{row.internalPN || '-'}</span>;
             case 'mfrPN': return <span className="font-mono text-amber-700">{row.mfrPN || '-'}</span>;
+            case 'description': return (
+                <div className="flex flex-col">
+                    <span className="font-bold text-slate-800">{row.description || '-'}</span>
+                    {row.status && (
+                        <span className={`w-fit mt-1 text-[8px] font-black uppercase px-2 py-0.5 rounded-full ${STATUS_COLORS[row.status] || 'bg-slate-100 text-slate-600'}`}>
+                            {row.status.replace(/_/g, ' ')}
+                        </span>
+                    )}
+                </div>
+            );
             default: return String(row[key] || '-');
         }
     };
@@ -413,6 +445,38 @@ export const PartHistory: React.FC<PartHistoryProps> = ({ orders, suppliers }) =
                                                             </div>
                                                         </div>
                                                     </div>
+
+                                                    {/* Cancellation / Revert Details */}
+                                                    {(row.cancellationReason || row.revertReason) && (
+                                                        <div className="mt-6">
+                                                            {row.cancellationReason && (
+                                                                <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4">
+                                                                    <div className="flex items-center gap-2 text-rose-700 font-black text-xs uppercase tracking-wider">
+                                                                        <i className="fa-solid fa-ban"></i>
+                                                                        <span>{isAr ? 'تم إلغاء أمر الشراء (تم الإرجاع إلى طلب عرض الأسعار)' : 'PO Cancelled (Returned to Send RFP)'}</span>
+                                                                        {row.cancelledPoNumber && <span className="font-mono text-rose-800 font-bold">({row.cancelledPoNumber})</span>}
+                                                                    </div>
+                                                                    <p className="text-xs font-bold text-rose-900 mt-1.5 leading-relaxed">
+                                                                        <span className="text-rose-600 font-semibold">{isAr ? 'سبب الإلغاء: ' : 'Reason: '}</span>
+                                                                        {row.cancellationReason}
+                                                                    </p>
+                                                                </div>
+                                                            )}
+                                                            {row.revertReason && (
+                                                                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4">
+                                                                    <div className="flex items-center gap-2 text-amber-700 font-black text-xs uppercase tracking-wider">
+                                                                        <i className="fa-solid fa-rotate-left"></i>
+                                                                        <span>{isAr ? 'تم الإرجاع إلى الترسية' : 'Reverted to Award Status'}</span>
+                                                                        {row.revertedPoNumber && <span className="font-mono text-amber-800 font-bold">({row.revertedPoNumber})</span>}
+                                                                    </div>
+                                                                    <p className="text-xs font-bold text-amber-900 mt-1.5 leading-relaxed">
+                                                                        <span className="text-amber-600 font-semibold">{isAr ? 'سبب الإرجاع: ' : 'Reason: '}</span>
+                                                                        {row.revertReason}
+                                                                    </p>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
 
                                                     {/* Order Logs Timeline */}
                                                     {row.orderLogs.length > 0 && (

@@ -8,6 +8,7 @@ import * as XLSX from 'xlsx';
 import { PartHistory } from './PartHistory';
 import { useLanguage, LanguageProvider } from '../contexts/LanguageContext';
 import { LanguageToggle } from './LanguageToggle';
+import { getItemEffectiveQty } from '../utils';
 
 // Converts SVG data URL to PNG data URL for html2canvas compatibility
 const rasterizeLogo = (logoDataUrl: string): Promise<string> => {
@@ -260,6 +261,86 @@ const getCurrentCostSheetItem = (order: CustomerOrder | null, selectedItemId: st
   return order.items.find(item => item.id === selectedItemId) || null;
 };
 
+export const extractCostSheetMetrics = (base64Data: string): { resourceCount: number; realCost: number; invoiceTotal: number } => {
+  if (!base64Data) return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+  try {
+    const cleanBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
+    const wb = XLSX.read(cleanBase64, { type: 'base64' });
+    const sheetName = wb.SheetNames[0];
+    if (!sheetName) return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+    const sheet = wb.Sheets[sheetName];
+    const data: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+    let salaryTotalCol = -1;
+    let invoiceTotalCol = -1;
+    let nameCol = 0;
+
+    // Scan top 5 rows for column headers
+    for (let r = 0; r < Math.min(5, data.length); r++) {
+      const row = data[r] || [];
+      for (let c = 0; c < row.length; c++) {
+        const val = String(row[c] || '').trim();
+        if ((val.includes('المرتب') || val.includes('مرتب')) && (val.includes('اجمال') || val.includes('إجمال') || val.includes('صافي') || val.includes('قيمه') || val.includes('قيمة'))) {
+          if (salaryTotalCol === -1 || val.includes('اجمال') || val.includes('إجمال')) {
+            salaryTotalCol = c;
+          }
+        }
+        if ((val.includes('الفاتور') || val.includes('فاتور')) && (val.includes('اجمال') || val.includes('إجمال') || val.includes('صافي') || val.includes('قيمه') || val.includes('قيمة'))) {
+          if (invoiceTotalCol === -1 || val.includes('اجمال') || val.includes('إجمال')) {
+            invoiceTotalCol = c;
+          }
+        }
+        if (val === 'الاسم' || val === 'اسم' || val.toLowerCase() === 'name') {
+          nameCol = c;
+        }
+      }
+    }
+
+    let resourceCount = 0;
+    let realCost = 0;
+    let invoiceTotal = 0;
+
+    for (let r = 0; r < data.length; r++) {
+      const row = data[r] || [];
+      const cell0 = String(row[nameCol] || '').trim();
+      if (!cell0) continue;
+
+      const isSummaryOrHeader = 
+        cell0.includes('اجمال') || cell0.includes('إجمال') ||
+        cell0.includes('مجموع') || cell0.includes('المجموع') ||
+        cell0.includes('صافي') || cell0.includes('الصافي') ||
+        /^(الاسم|اسم|name|كشف|بيان|تقرير|report|sheet)/i.test(cell0) ||
+        cell0.toLowerCase().includes('total') ||
+        cell0.toLowerCase().includes('subtotal') ||
+        cell0.toLowerCase().includes('summary');
+
+      if (isSummaryOrHeader) {
+        if (cell0.includes('اجمال') || cell0.includes('إجمال') || cell0.toLowerCase().includes('total')) {
+          const numSalary = typeof row[salaryTotalCol] === 'number' ? row[salaryTotalCol] : parseFloat(String(row[salaryTotalCol] || '').replace(/,/g, ''));
+          if (!isNaN(numSalary) && numSalary > realCost) {
+            realCost = numSalary;
+          }
+          const numInv = typeof row[invoiceTotalCol] === 'number' ? row[invoiceTotalCol] : parseFloat(String(row[invoiceTotalCol] || '').replace(/,/g, ''));
+          if (!isNaN(numInv) && numInv > invoiceTotal) {
+            invoiceTotal = numInv;
+          }
+        }
+      } else {
+        resourceCount++;
+      }
+    }
+
+    return {
+      resourceCount,
+      realCost: Math.round(realCost * 100) / 100,
+      invoiceTotal: Math.round(invoiceTotal * 100) / 100
+    };
+  } catch (e) {
+    console.error('[CostSheet] Extraction error:', e);
+    return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+  }
+};
+
 /**
  * Binary PO-readiness gate (the "0/1" approach).
  * Returns true (1) if a component has reached or passed the Issue PO stage.
@@ -269,8 +350,8 @@ const getCurrentCostSheetItem = (order: CustomerOrder | null, selectedItemId: st
  */
 const hasReachedPoReadiness = (status: string | undefined): boolean => {
   if (!status) return false;
-  // Only these two statuses mean the component hasn't reached PO yet
-  return !['PENDING_OFFER', 'RFP_SENT'].includes(status);
+  // These statuses mean the component hasn't reached PO yet
+  return !['PENDING_OFFER', 'RFP_SENT', 'RUNNING_OUTSOURCING_CONTRACT'].includes(status);
 };
 
 /**
@@ -378,6 +459,22 @@ const CompThreshold: React.FC<{ component: ManufacturingComponent, config: AppCo
   );
 };
 
+export const formatSupplierName = (s?: Supplier): string => {
+  if (!s) return '';
+  const name = (s.name || '').trim();
+  const contact = (s.contactName || '').trim();
+  const phone = (s.contactPhone || s.phone || '').trim();
+
+  let res = name;
+  if (contact && contact.toLowerCase() !== name.toLowerCase()) {
+    res = `${name} — ${contact}`;
+  }
+  if (phone) {
+    res += ` (${phone})`;
+  }
+  return res || 'Unknown Supplier';
+};
+
 const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refreshKey, currentUser }) => {
   const { t } = useLanguage();
   const [orders, setOrders] = useState<CustomerOrder[]>([]);
@@ -412,7 +509,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
 
   // Modal States
   const [activeAction, setActiveAction] = useState<{
-    type: 'RFP' | 'AWARD' | 'PO' | 'RESET' | 'ORDER_ROLLBACK' | 'CANCEL_PO_BATCH' | 'REVIVE_CONTRACT';
+    type: 'RFP' | 'AWARD' | 'PO' | 'RESET' | 'ORDER_ROLLBACK' | 'CANCEL_PO_BATCH' | 'REVIVE_CONTRACT' | 'REVERT_PO' | 'REVERT_TO_PENDING';
     order: CustomerOrder;
     item?: CustomerOrderItem;
     comp?: ManufacturingComponent;
@@ -443,8 +540,10 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const costSheetStubRef = useRef<HTMLTableCellElement>(null);
   const costSheetRowRef = useRef<HTMLTableRowElement>(null);
   const [costSheetFrozenTop, setCostSheetFrozenTop] = useState(0);
+  const [costSheetFrozenLeft, setCostSheetFrozenLeft] = useState(0);
   const [costSheetRowHeight, setCostSheetRowHeight] = useState(0);
   const [noRfpOverrides, setNoRfpOverrides] = useState<Record<string, boolean>>({});
+  const [eraseWrongDataByOrder, setEraseWrongDataByOrder] = useState<Record<string, boolean>>({});
 
   const hasCostSheetUploaded = (o: CustomerOrder, item?: CustomerOrderItem) => {
     if (item) return Boolean(item.costSheetFile || item.costSheetText);
@@ -453,6 +552,12 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
 
   const isOrderNoRfp = (o: CustomerOrder) => {
     if (noRfpOverrides[o.id] !== undefined) return noRfpOverrides[o.id];
+    // If all procurement components have explicit noRfpNeeded === false, order is not No RFP
+    const allProcComps = (o.items || []).flatMap(it => it.components || []).filter(c => c.source === 'PROCUREMENT');
+    if (allProcComps.length > 0 && allProcComps.every(c => c.noRfpNeeded === false)) return false;
+    // No RFP Needed is checked by default for outsourcing orders
+    const isOutsourcing = activeTab === 'outsourcing' || (o.items || []).some(i => i.productionType === 'OUTSOURCING');
+    if (isOutsourcing) return true;
     return hasCostSheetUploaded(o);
   };
 
@@ -460,16 +565,66 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
     const compKey = `${o.id}_${item.id}_${comp.id}`;
     if (noRfpOverrides[compKey] !== undefined) return noRfpOverrides[compKey];
     if (noRfpOverrides[o.id] !== undefined) return noRfpOverrides[o.id];
+    if (comp.noRfpNeeded !== undefined) return comp.noRfpNeeded;
+    if (item.noRfpNeeded !== undefined) return item.noRfpNeeded;
+    // No RFP Needed is checked by default for outsourcing components
+    if (activeTab === 'outsourcing' || item.productionType === 'OUTSOURCING' || comp.contractNumber) return true;
     return hasCostSheetUploaded(o, item);
   };
 
-  const handleToggleOrderNoRfp = (orderId: string, val: boolean) => {
-    setNoRfpOverrides(prev => ({ ...prev, [orderId]: val }));
+  const handleToggleOrderNoRfp = async (orderId: string, val: boolean) => {
+    setNoRfpOverrides(prev => {
+      const next = { ...prev, [orderId]: val };
+      Object.keys(next).forEach(k => {
+        if (k.startsWith(`${orderId}_`)) {
+          delete next[k];
+        }
+      });
+      return next;
+    });
+
+    const targetOrder = (orders || []).find(ord => ord.id === orderId);
+    if (targetOrder) {
+      for (const it of targetOrder.items || []) {
+        for (const cp of it.components || []) {
+          if (cp.source === 'PROCUREMENT') {
+            try {
+              const newStatus = val 
+                ? (['PENDING_OFFER', 'NEW', undefined].includes(cp.status) ? 'RUNNING_OUTSOURCING_CONTRACT' : cp.status)
+                : (cp.status === 'RUNNING_OUTSOURCING_CONTRACT' ? 'PENDING_OFFER' : cp.status);
+              await dataService.updateComponent(orderId, it.id, cp.id!, {
+                noRfpNeeded: val,
+                status: newStatus
+              });
+            } catch (err) {
+              console.warn('Failed to persist comp noRfpNeeded', err);
+            }
+          }
+        }
+      }
+      await fetchData();
+    }
   };
 
-  const handleToggleCompNoRfp = (orderId: string, itemId: string, compId: string, val: boolean) => {
+  const handleToggleCompNoRfp = async (orderId: string, itemId: string, compId: string, val: boolean) => {
     const compKey = `${orderId}_${itemId}_${compId}`;
     setNoRfpOverrides(prev => ({ ...prev, [compKey]: val }));
+
+    try {
+      const targetOrder = (orders || []).find(ord => ord.id === orderId);
+      const targetItem = targetOrder?.items.find(it => it.id === itemId);
+      const targetComp = targetItem?.components?.find(cp => cp.id === compId);
+      const newStatus = val 
+        ? (['PENDING_OFFER', 'NEW', undefined].includes(targetComp?.status) ? 'RUNNING_OUTSOURCING_CONTRACT' : targetComp?.status)
+        : (targetComp?.status === 'RUNNING_OUTSOURCING_CONTRACT' ? 'PENDING_OFFER' : targetComp?.status);
+      await dataService.updateComponent(orderId, itemId, compId, {
+        noRfpNeeded: val,
+        status: newStatus
+      });
+      await fetchData();
+    } catch (err) {
+      console.warn('Failed to persist single comp noRfpNeeded', err);
+    }
   };
 
   useEffect(() => {
@@ -642,15 +797,16 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
     const file = e.target.files?.[0];
     if (!file || !uploadTargetOrder) return;
     const { order, itemId } = uploadTargetOrder;
+    const replaceWrongData = Boolean(eraseWrongDataByOrder[order.id]);
     const reader = new FileReader();
     reader.onload = async (evt) => {
       const result = evt.target?.result as string;
       try {
-        await dataService.uploadCostSheet(order.id, itemId, result, file.name);
+        await dataService.uploadCostSheet(order.id, itemId, result, file.name, undefined, undefined, replaceWrongData);
         await fetchData();
-        alert(`Cost sheet '${file.name}' successfully uploaded and updated for order ${order.internalOrderNumber || order.customerReferenceNumber}.`);
+        alert(`Cost sheet '${file.name}' successfully uploaded for order ${order.internalOrderNumber || order.customerReferenceNumber}.`);
       } catch (err: any) {
-        alert(err.message || 'Failed to upload and overwrite cost sheet.');
+        alert(err.message || 'Failed to upload cost sheet.');
       } finally {
         setUploadTargetOrder(null);
         if (headerCostSheetInputRef.current) headerCostSheetInputRef.current.value = '';
@@ -740,7 +896,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const today = new Date().toISOString().split('T')[0];
   const selectedOutsourced = multiComps.some(({ item: mi, comp: mc }) => selectedCompIds.includes(mc.id!) && mi.productionType === 'OUTSOURCING');
   const isContractStartDateInvalid = selectedOutsourced && contractStartDate.trim() && contractStartDate < today && !allowPastContractStart;
-  const isCommitProcurementDisabled = isActionLoading != null || ((activeAction?.type === 'RESET' || activeAction?.type === 'ORDER_ROLLBACK' || activeAction?.type === 'CANCEL_PO_BATCH') && !resetReason.trim()) || (activeAction?.type === 'REVIVE_CONTRACT' && (!reviveReason.trim() || (reviveMode === 'EXTENSION' ? !reviveDuration.trim() : !reviveEndDate.trim()))) || (activeAction?.type === 'PO' && (!poNumberInput.trim() || selectedCompIds.length === 0 || (selectedOutsourced && !contractStartDate.trim()) || isContractStartDateInvalid));
+  const isCommitProcurementDisabled = isActionLoading != null || ((activeAction?.type === 'RESET' || activeAction?.type === 'ORDER_ROLLBACK' || activeAction?.type === 'CANCEL_PO_BATCH' || activeAction?.type === 'REVERT_PO') && !resetReason.trim()) || (activeAction?.type === 'REVIVE_CONTRACT' && (!reviveReason.trim() || (reviveMode === 'EXTENSION' ? !reviveDuration.trim() : !reviveEndDate.trim()))) || (activeAction?.type === 'PO' && (!poNumberInput.trim() || selectedCompIds.length === 0 || (selectedOutsourced && !contractStartDate.trim()) || isContractStartDateInvalid));
 
   // Procurement resolution state (for in-transit components during rollback)
   type CompResolution = 'CANCEL_PO' | 'RECEIVE_TO_STOCK';
@@ -766,7 +922,12 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const fetchData = async () => {
     const [o, s] = await Promise.all([dataService.getOrders(), dataService.getSuppliers()]);
     setAllOrders(o);
-    const eligibleOrders = o.filter(order => order.status !== OrderStatus.REJECTED && order.status !== OrderStatus.FULFILLED);
+    const eligibleOrders = o.filter(order =>
+      order.status !== OrderStatus.REJECTED &&
+      order.status !== OrderStatus.FULFILLED &&
+      order.status !== OrderStatus.LOGGED &&
+      order.status !== OrderStatus.TECHNICAL_REVIEW
+    );
     setOrders(eligibleOrders);
     setSuppliers(s.filter(supp => !supp.isDeletedSupplier && supp.name.trim().toLowerCase() !== 'deleted suppliers' && supp.name.trim().toLowerCase() !== 'deleted suppleirs'));
   };
@@ -775,6 +936,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const purchaseGroups = useMemo(() => {
     const map = new Map<string, { order: CustomerOrder, comps: { item: CustomerOrderItem, comp: ManufacturingComponent }[] }>();
     orders.forEach(o => {
+      if (o.status === OrderStatus.LOGGED || o.status === OrderStatus.TECHNICAL_REVIEW) return;
       o.items.forEach((i, idx) => {
         if (i.productionType === 'OUTSOURCING') return; // Skip in this tab
         const itemComps = (i.components && i.components.length > 0)
@@ -819,6 +981,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const outsourcingGroups = useMemo(() => {
     const map = new Map<string, { order: CustomerOrder, comps: { item: CustomerOrderItem, comp: ManufacturingComponent }[] }>();
     orders.forEach(o => {
+      if (o.status === OrderStatus.LOGGED || o.status === OrderStatus.TECHNICAL_REVIEW) return;
       o.items.forEach((i, idx) => {
         if (i.productionType !== 'OUTSOURCING') return; // Skip in this tab
         const itemComps = (i.components && i.components.length > 0)
@@ -838,7 +1001,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
             } as ManufacturingComponent];
 
         itemComps.forEach(c => {
-          if (c.source === 'PROCUREMENT' && ['PENDING_OFFER', 'RFP_SENT', 'AWARDED', 'ORDERED', 'WAITING_CONTRACT_START', 'RECEIVED', 'RESERVED', 'IN_MANUFACTURING', 'MANUFACTURED'].includes(c.status || '')) {
+          if (c.source === 'PROCUREMENT' && ['PENDING_OFFER', 'RFP_SENT', 'AWARDED', 'ORDERED', 'WAITING_CONTRACT_START', 'RECEIVED', 'RESERVED', 'IN_MANUFACTURING', 'MANUFACTURED', 'RUNNING_OUTSOURCING_CONTRACT'].includes(c.status || '')) {
             // Auto-cleanup: If contract end date passed more than 1 month ago, treat as finished and remove from active list
             if (c.contractStartDate && c.contractDuration) {
               const endDate = calculateContractEndDate(c.contractStartDate, c.contractDuration);
@@ -968,12 +1131,44 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
 
   const totalComponents = purchaseGroups.reduce((sum, g) => sum + g.comps.length, 0) + outsourcingGroups.reduce((sum, g) => sum + g.comps.length, 0);
 
+  const isFilteredByRfp = useMemo(() => {
+    if (activeAction?.type === 'AWARD') {
+      const rfpIds = new Set<string>();
+      if (activeAction.comp?.rfpSupplierIds?.length) {
+        activeAction.comp.rfpSupplierIds.forEach(id => rfpIds.add(id));
+      }
+      if (multiComps?.length) {
+        multiComps.forEach(m => {
+          if (m.comp?.rfpSupplierIds?.length) {
+            m.comp.rfpSupplierIds.forEach(id => rfpIds.add(id));
+          }
+        });
+      }
+      return rfpIds.size > 0 && suppliers.some(s => s.id && rfpIds.has(s.id));
+    }
+    return false;
+  }, [activeAction, multiComps, suppliers]);
+
   const awardSuppliersList = useMemo(() => {
-    if (activeAction?.type === 'AWARD' && activeAction.comp?.rfpSupplierIds?.length) {
-      return suppliers.filter(s => activeAction.comp?.rfpSupplierIds?.includes(s.id));
+    if (activeAction?.type === 'AWARD') {
+      const rfpIds = new Set<string>();
+      if (activeAction.comp?.rfpSupplierIds?.length) {
+        activeAction.comp.rfpSupplierIds.forEach(id => rfpIds.add(id));
+      }
+      if (multiComps?.length) {
+        multiComps.forEach(m => {
+          if (m.comp?.rfpSupplierIds?.length) {
+            m.comp.rfpSupplierIds.forEach(id => rfpIds.add(id));
+          }
+        });
+      }
+      if (rfpIds.size > 0) {
+        const matched = suppliers.filter(s => s.id && rfpIds.has(s.id));
+        if (matched.length > 0) return matched;
+      }
     }
     return suppliers;
-  }, [activeAction, suppliers]);
+  }, [activeAction, suppliers, multiComps]);
 
   const handleDownloadPO = async (order: CustomerOrder, comp: ManufacturingComponent) => {
     if (isPoPdfGenerating) return;
@@ -1238,6 +1433,14 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
         }
 
         await dataService.rollbackOrderToLogged(order.id, resetReason);
+        setNoRfpOverrides(prev => {
+          const next = { ...prev };
+          delete next[order.id];
+          Object.keys(next).forEach(k => {
+            if (k.startsWith(`${order.id}_`)) delete next[k];
+          });
+          return next;
+        });
         await fetchData();
         closeModal();
       } catch (e: any) { alert(e.message); }
@@ -1291,13 +1494,17 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
 
         setIsActionLoading('bulk-cancel');
         await dataService.dispatchAction(order.id, 'cancel-po-batch', {
-          sendPoId: comp?.sendPoId
+          sendPoId: comp?.sendPoId,
+          reason: resetReason.trim()
         });
       } else if (type === 'REVERT_PO') {
+        if (!resetReason.trim()) throw new Error("Revert reason is required");
+
         setIsActionLoading('revert-po');
         await dataService.dispatchAction(order.id, 'revert-po', {
           itemId: item.id,
-          componentId: comp.id
+          componentId: comp.id,
+          reason: resetReason.trim()
         });
       } else if (type === 'REVERT_TO_PENDING') {
         setIsActionLoading('revert-to-pending');
@@ -2303,6 +2510,21 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                 }).length;
                 const totalItems = o.items.length;
 
+                const targetItem = o.items.find(item => item.costSheetFile) || o.items.find(item => item.productionType === 'OUTSOURCING') || o.items[0];
+                const outsourcingMetrics = (() => {
+                  if (!targetItem) return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+                  let count = targetItem.workingResourceCount || 0;
+                  let cost = targetItem.realCost || 0;
+                  let inv = targetItem.invoiceTotal || 0;
+                  if ((!count || !cost) && targetItem.costSheetFile) {
+                    const extracted = extractCostSheetMetrics(targetItem.costSheetFile);
+                    if (!count) count = extracted.resourceCount;
+                    if (!cost) cost = extracted.realCost;
+                    if (!inv) inv = extracted.invoiceTotal;
+                  }
+                  return { resourceCount: count, realCost: cost, invoiceTotal: inv };
+                })();
+
                 return (
                   <div key={o.id} className="bg-gradient-to-b from-slate-50 to-white rounded-[2rem] border border-slate-200 overflow-hidden transition-all shadow-sm">
                     {/* Order Header */}
@@ -2384,120 +2606,271 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                           {anyOrdered ? t('procurement.actions.rollbackLocked') : t('procurement.actions.rollbackOrder')}
                         </button>
 
-                        {/* Global Issue PO for all awarded comps */}
-                        {readyForPo && allOrderProcurementAwarded && (
-                          <button
-                            disabled={o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded}
-                            onClick={async (e) => {
-                              e.stopPropagation();
-                              const po = await dataService.getUniquePoNumber();
-                              setPoNumberInput(po);
-                              const awarded = comps.filter(({ comp: cc }) => cc.status === 'AWARDED');
-                              if (awarded.length > 0) {
-                                const sId = awarded[0].comp.supplierId;
-                                const sameSupplier = awarded.filter(a => a.comp.supplierId === sId);
-                                setMultiComps(sameSupplier);
-                                setSelectedCompIds(sameSupplier.map(m => m.comp.id!));
-                                const contractInfo = deriveOutsourcingContractInfo(sameSupplier);
-                                setContractNumber(contractInfo.contractNumber);
-                                setContractStartDate(contractInfo.contractStartDate);
-                                setActiveAction({ type: 'PO', order: o, item: sameSupplier[0].item, comp: sameSupplier[0].comp });
-                              }
-                            }}
-                            className={`px-5 py-2.5 rounded-xl text-[10px] font-black uppercase shadow-lg flex items-center gap-2 transition-all ${o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-100'
-                              }`}
-                          >
-                            <i className="fa-solid fa-file-invoice"></i> {t('procurement.po.issuePOAll')}
-                          </button>
-                        )}
-                        {/* Cost Sheet / Download / Upload Buttons */}
-                        {(o.blanketOrder || o.items.some(item => item.costSheetFile || item.costSheetText || item.productionType === 'OUTSOURCING')) && (
-                          <div className="flex items-center gap-2 flex-wrap">
-                            {/* Download Cost Sheet Button (if file attached) */}
-                            {o.items.some(item => item.costSheetFile) && (
+                        {/* Outsourcing Contract Bar vs Standard Purchasing Flow */}
+                        {isOrderNoRfp(o) ? (
+                          <div className="flex items-center gap-3 flex-wrap">
+                            {/* PO Issue Date */}
+                            <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-xl text-slate-700">
+                              <i className="fa-solid fa-calendar-day text-purple-600 text-xs"></i>
+                              <div className="flex flex-col">
+                                <span className="text-[8px] font-black uppercase tracking-wider text-slate-400 leading-none">
+                                  {t('procurement.outsourcingCard.poIssueDate') || 'PO Date'}
+                                </span>
+                                <span className="text-[11px] font-black mt-0.5">
+                                  {o.orderDate ? new Date(o.orderDate).toLocaleDateString() : (o.dataEntryTimestamp ? new Date(o.dataEntryTimestamp).toLocaleDateString() : 'N/A')}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Working Number of Resources */}
+                            <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-xl text-emerald-900 shadow-xs">
+                              <i className="fa-solid fa-users text-emerald-600 text-xs"></i>
+                              <div className="flex flex-col">
+                                <span className="text-[8px] font-black uppercase tracking-wider text-emerald-700 leading-none">
+                                  {t('procurement.outsourcingCard.workingResources') || 'Working Resources'}
+                                </span>
+                                <span className="text-[11px] font-black mt-0.5">
+                                  {outsourcingMetrics.resourceCount > 0 ? `${outsourcingMetrics.resourceCount} Persons` : '—'}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Total Real Cost to Company */}
+                            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 px-3 py-1.5 rounded-xl text-blue-900 shadow-xs">
+                              <i className="fa-solid fa-coins text-blue-600 text-xs"></i>
+                              <div className="flex flex-col">
+                                <span className="text-[8px] font-black uppercase tracking-wider text-blue-700 leading-none">
+                                  {t('procurement.outsourcingCard.realCostToCompany') || 'Real Cost'}
+                                </span>
+                                <span className="text-[11px] font-black mt-0.5">
+                                  {outsourcingMetrics.realCost > 0 ? `${outsourcingMetrics.realCost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} L.E.` : '—'}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Upload Updated Sheet + Erase Wrong Data Checkbox */}
+                            <div className="flex items-center gap-2 bg-white border border-slate-200 p-1 rounded-xl shadow-xs">
                               <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const itemWithFile = o.items.find(item => item.costSheetFile);
-                                  if (itemWithFile && itemWithFile.costSheetFile) {
-                                    const link = document.createElement('a');
-                                    link.href = itemWithFile.costSheetFile;
-                                    link.download = itemWithFile.costSheetFileName || `CostSheet-${o.internalOrderNumber || o.customerReferenceNumber}.xlsx`;
-                                    document.body.appendChild(link);
-                                    link.click();
-                                    document.body.removeChild(link);
-                                  } else {
-                                    openCostSheetModal(o);
-                                  }
-                                }}
-                                className="px-4 py-2.5 rounded-xl text-[10px] font-black uppercase bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-emerald-100 transition-all flex items-center gap-2 whitespace-nowrap"
-                                title="Download attached Excel cost sheet"
+                                onClick={(e) => triggerHeaderCostSheetUpload(o, e)}
+                                className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-[10px] font-black uppercase flex items-center gap-1.5 shadow-sm transition-all cursor-pointer whitespace-nowrap"
+                                title="Upload updated Excel cost sheet"
                               >
-                                <i className="fa-solid fa-file-excel"></i> Download Cost Sheet
+                                <i className="fa-solid fa-cloud-arrow-up"></i>
+                                <span>{t('procurement.outsourcingCard.uploadUpdatedSheet') || 'Upload Updated Sheet'}</span>
                               </button>
-                            )}
 
-                            {/* Upload / Overwrite Cost Sheet Button */}
-                            <button
-                              onClick={(e) => triggerHeaderCostSheetUpload(o, e)}
-                              className="px-4 py-2.5 rounded-xl text-[10px] font-black uppercase bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100 transition-all flex items-center gap-2 whitespace-nowrap"
-                              title="Upload and overwrite the cost sheet spreadsheet for this order"
-                            >
-                              <i className="fa-solid fa-file-arrow-up"></i> Upload
-                            </button>
-
-                            {/* View / Edit Cost Sheet Button */}
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openCostSheetModal(o);
-                              }}
-                              className="px-5 py-2.5 rounded-xl text-[10px] font-black uppercase bg-violet-600 text-white hover:bg-violet-700 shadow-md shadow-violet-100 transition-all flex items-center gap-2 whitespace-nowrap"
-                              title="Open interactive cost sheet viewer/editor"
-                            >
-                              <i className="fa-solid fa-file-lines"></i> Cost Sheet
-                            </button>
-
-                            {/* Auto No RFP Needed Checkbox for Outsourcing */}
-                            {(activeTab === 'outsourcing' || o.items.some(item => item.productionType === 'OUTSOURCING')) && (
                               <label
                                 onClick={(e) => e.stopPropagation()}
-                                className={`inline-flex items-center gap-2 px-3 py-2 rounded-xl border text-[9px] font-black uppercase cursor-pointer select-none transition-all ${
-                                  isOrderNoRfp(o)
-                                    ? 'bg-amber-50 border-amber-300 text-amber-900 shadow-sm'
-                                    : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-slate-300'
+                                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[9px] font-bold cursor-pointer select-none transition-all ${
+                                  Boolean(eraseWrongDataByOrder[o.id])
+                                    ? 'bg-rose-50 text-rose-700 border border-rose-200 font-black'
+                                    : 'text-slate-500 hover:text-slate-700'
                                 }`}
-                                title={
-                                  hasCostSheetUploaded(o)
-                                    ? 'Cost sheet attached: No need to send RFPs to suppliers (Direct Award enabled)'
-                                    : 'No cost sheet attached: Send RFPs to suppliers before awarding'
-                                }
+                                title={t('procurement.outsourcingCard.eraseWrongDataHelp') || 'Check this only if the previously uploaded sheet had errors and needs to be replaced. Leave unchecked to keep history and add an extra monthly sheet.'}
                               >
                                 <input
                                   type="checkbox"
-                                  checked={isOrderNoRfp(o)}
-                                  onChange={(e) => handleToggleOrderNoRfp(o.id, e.target.checked)}
-                                  className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 h-3.5 w-3.5 cursor-pointer"
+                                  checked={Boolean(eraseWrongDataByOrder[o.id])}
+                                  onChange={(e) => {
+                                    const checked = e.target.checked;
+                                    setEraseWrongDataByOrder(prev => ({ ...prev, [o.id]: checked }));
+                                  }}
+                                  className="rounded border-slate-300 text-rose-600 focus:ring-rose-500 h-3.5 w-3.5 cursor-pointer"
                                 />
-                                <span className="flex items-center gap-1.5 whitespace-nowrap">
-                                  <i className={`fa-solid ${isOrderNoRfp(o) ? 'fa-bolt text-amber-500' : 'fa-paper-plane text-slate-400'} text-[9px]`}></i>
-                                  No RFP Needed
-                                </span>
+                                <span>{t('procurement.outsourcingCard.eraseWrongData') || 'Erase the current wrong uploaded data'}</span>
                               </label>
+                            </div>
+
+                            {/* View & Download Sheet */}
+                            <div className="flex items-center gap-1.5">
+                              {targetItem?.costSheetFile && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const link = document.createElement('a');
+                                    link.href = targetItem.costSheetFile!;
+                                    link.download = targetItem.costSheetFileName || `CostSheet-${o.internalOrderNumber || o.customerReferenceNumber}.xlsx`;
+                                    document.body.appendChild(link);
+                                    link.click();
+                                    document.body.removeChild(link);
+                                  }}
+                                  className="px-3 py-1.5 rounded-lg text-[9px] font-black uppercase bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 transition-all flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                                  title="Download current Excel cost sheet"
+                                >
+                                  <i className="fa-solid fa-file-excel text-emerald-600"></i>
+                                  <span>{t('procurement.outsourcingCard.downloadSheet') || 'Download'}</span>
+                                </button>
+                              )}
+
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openCostSheetModal(o);
+                                }}
+                                className="px-3 py-1.5 rounded-lg text-[9px] font-black uppercase bg-violet-50 border border-violet-200 text-violet-700 hover:bg-violet-100 transition-all flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                                title="Open interactive spreadsheet viewer"
+                              >
+                                <i className="fa-solid fa-table-cells text-violet-600"></i>
+                                <span>{t('procurement.outsourcingCard.viewSheet') || 'View Sheet'}</span>
+                              </button>
+                            </div>
+
+                            {/* No RFP Needed Checkbox */}
+                            <label
+                              onClick={(e) => e.stopPropagation()}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[9px] font-black uppercase cursor-pointer select-none transition-all bg-amber-50 border-amber-300 text-amber-900 shadow-xs"
+                              title="No RFP needed for outsourcing contract"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isOrderNoRfp(o)}
+                                onChange={(e) => handleToggleOrderNoRfp(o.id, e.target.checked)}
+                                className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 h-3.5 w-3.5 cursor-pointer"
+                              />
+                              <span className="flex items-center gap-1 whitespace-nowrap">
+                                <i className="fa-solid fa-bolt text-amber-500 text-[9px]"></i>
+                                No RFP Needed
+                              </span>
+                            </label>
+
+                            {/* Sheet History Chips */}
+                            {targetItem?.costSheets && targetItem.costSheets.length > 1 && (
+                              <div className="flex items-center gap-1.5 text-[8px] font-bold text-slate-500 bg-slate-50 px-2 py-1 rounded-lg border border-slate-200">
+                                <span className="font-black text-slate-600 flex items-center gap-1">
+                                  <i className="fa-solid fa-clock-rotate-left text-slate-400"></i>
+                                  {t('procurement.outsourcingCard.sheetHistory') || 'History'}:
+                                </span>
+                                {targetItem.costSheets.map((rec, rIdx) => (
+                                  <button
+                                    key={rec.id || rIdx}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (rec.fileData) {
+                                        const link = document.createElement('a');
+                                        link.href = rec.fileData;
+                                        link.download = rec.fileName;
+                                        document.body.appendChild(link);
+                                        link.click();
+                                        document.body.removeChild(link);
+                                      }
+                                    }}
+                                    className="px-1.5 py-0.5 bg-white border border-slate-200 hover:border-purple-300 rounded text-purple-700 font-mono text-[8px] hover:bg-purple-50 transition-colors"
+                                    title={`Uploaded: ${new Date(rec.uploadedAt).toLocaleDateString()} - ${rec.workingResourceCount || 0} resources, ${rec.realCost || 0} LE`}
+                                  >
+                                    {rec.fileName} ({new Date(rec.uploadedAt).toLocaleDateString('en-US', { month: 'short' })})
+                                  </button>
+                                ))}
+                              </div>
                             )}
                           </div>
-                        )}
-                        {anyOrderProcurementNotReady && (
-                          <div className="flex items-center gap-1.5 text-[8px] font-black text-rose-600 uppercase bg-rose-50 px-3 py-1.5 rounded-lg">
-                            <i className="fa-solid fa-circle-exclamation"></i>
-                            {t('procurement.actions.notAllReady')}
-                          </div>
-                        )}
-                        {!readyForPo && !allOrderedOrHigher && !anyOrderProcurementNotReady && (
-                          <div className="flex items-center gap-1.5 text-[8px] font-black text-amber-600 uppercase bg-amber-50 px-3 py-1.5 rounded-lg">
-                            <i className="fa-solid fa-hourglass-half"></i>
-                            {t('procurement.actions.allMustBeAwarded')}
-                          </div>
+                        ) : (
+                          <>
+                            {readyForPo && allOrderProcurementAwarded && (
+                              <button
+                                disabled={o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded}
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  const po = await dataService.getUniquePoNumber();
+                                  setPoNumberInput(po);
+                                  const awarded = comps.filter(({ comp: cc }) => cc.status === 'AWARDED');
+                                  if (awarded.length > 0) {
+                                    const sId = awarded[0].comp.supplierId;
+                                    const sameSupplier = awarded.filter(a => a.comp.supplierId === sId);
+                                    setMultiComps(sameSupplier);
+                                    setSelectedCompIds(sameSupplier.map(m => m.comp.id!));
+                                    const contractInfo = deriveOutsourcingContractInfo(sameSupplier);
+                                    setContractNumber(contractInfo.contractNumber);
+                                    setContractStartDate(contractInfo.contractStartDate);
+                                    setActiveAction({ type: 'PO', order: o, item: sameSupplier[0].item, comp: sameSupplier[0].comp });
+                                  }
+                                }}
+                                className={`px-5 py-2.5 rounded-xl text-[10px] font-black uppercase shadow-lg flex items-center gap-2 transition-all ${o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-100'
+                                  }`}
+                              >
+                                <i className="fa-solid fa-file-invoice"></i> {t('procurement.po.issuePOAll')}
+                              </button>
+                            )}
+
+                            {/* Cost Sheet / Download / Upload Buttons for standard orders */}
+                            {(o.blanketOrder || o.items.some(item => item.costSheetFile || item.costSheetText || item.productionType === 'OUTSOURCING')) && (
+                              <div className="flex items-center gap-2 flex-wrap">
+                                {o.items.some(item => item.costSheetFile) && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const itemWithFile = o.items.find(item => item.costSheetFile);
+                                      if (itemWithFile && itemWithFile.costSheetFile) {
+                                        const link = document.createElement('a');
+                                        link.href = itemWithFile.costSheetFile;
+                                        link.download = itemWithFile.costSheetFileName || `CostSheet-${o.internalOrderNumber || o.customerReferenceNumber}.xlsx`;
+                                        document.body.appendChild(link);
+                                        link.click();
+                                        document.body.removeChild(link);
+                                      } else {
+                                        openCostSheetModal(o);
+                                      }
+                                    }}
+                                    className="px-4 py-2.5 rounded-xl text-[10px] font-black uppercase bg-emerald-600 text-white hover:bg-emerald-700 shadow-md shadow-emerald-100 transition-all flex items-center gap-2 whitespace-nowrap"
+                                    title="Download attached Excel cost sheet"
+                                  >
+                                    <i className="fa-solid fa-file-excel"></i> Download Cost Sheet
+                                  </button>
+                                )}
+
+                                <button
+                                  onClick={(e) => triggerHeaderCostSheetUpload(o, e)}
+                                  className="px-4 py-2.5 rounded-xl text-[10px] font-black uppercase bg-blue-600 text-white hover:bg-blue-700 shadow-md shadow-blue-100 transition-all flex items-center gap-2 whitespace-nowrap"
+                                  title="Upload cost sheet"
+                                >
+                                  <i className="fa-solid fa-file-arrow-up"></i> Upload
+                                </button>
+
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openCostSheetModal(o);
+                                  }}
+                                  className="px-5 py-2.5 rounded-xl text-[10px] font-black uppercase bg-violet-600 text-white hover:bg-violet-700 shadow-md shadow-violet-100 transition-all flex items-center gap-2 whitespace-nowrap"
+                                  title="Open interactive cost sheet viewer/editor"
+                                >
+                                  <i className="fa-solid fa-file-lines"></i> Cost Sheet
+                                </button>
+
+                                <label
+                                  onClick={(e) => e.stopPropagation()}
+                                  className={`inline-flex items-center gap-2 px-3 py-2 rounded-xl border text-[9px] font-black uppercase cursor-pointer select-none transition-all ${
+                                    isOrderNoRfp(o)
+                                      ? 'bg-amber-50 border-amber-300 text-amber-900 shadow-sm'
+                                      : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-slate-300'
+                                  }`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={isOrderNoRfp(o)}
+                                    onChange={(e) => handleToggleOrderNoRfp(o.id, e.target.checked)}
+                                    className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 h-3.5 w-3.5 cursor-pointer"
+                                  />
+                                  <span className="flex items-center gap-1.5 whitespace-nowrap">
+                                    <i className={`fa-solid ${isOrderNoRfp(o) ? 'fa-bolt text-amber-500' : 'fa-paper-plane text-slate-400'} text-[9px]`}></i>
+                                    No RFP Needed
+                                  </span>
+                                </label>
+                              </div>
+                            )}
+
+                            {anyOrderProcurementNotReady && (
+                              <div className="flex items-center gap-1.5 text-[8px] font-black text-rose-600 uppercase bg-rose-50 px-3 py-1.5 rounded-lg">
+                                <i className="fa-solid fa-circle-exclamation"></i>
+                                {t('procurement.actions.notAllReady')}
+                              </div>
+                            )}
+                            {!readyForPo && !allOrderedOrHigher && !anyOrderProcurementNotReady && (
+                              <div className="flex items-center gap-1.5 text-[8px] font-black text-amber-600 uppercase bg-amber-50 px-3 py-1.5 rounded-lg">
+                                <i className="fa-solid fa-hourglass-half"></i>
+                                {t('procurement.actions.allMustBeAwarded')}
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     </div>
@@ -2515,6 +2888,12 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                         })();
 
                         const dynamicStatus = (() => {
+                          if (isCompNoRfp(o, i, c)) {
+                            return 'RUNNING_OUTSOURCING_CONTRACT';
+                          }
+                          if (c.status === 'RUNNING_OUTSOURCING_CONTRACT' && !isCompNoRfp(o, i, c)) {
+                            return 'PENDING_OFFER';
+                          }
                           if (activeTab !== 'outsourcing' || !c.contractStartDate || !c.contractDuration) return c.status || '';
                           const today = new Date();
                           today.setHours(0, 0, 0, 0);
@@ -2532,28 +2911,51 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                         return (
                           <div key={c.id} className="flex flex-col justify-between p-5 hover:bg-blue-50/30 transition-all group gap-3">
                             <div className="flex gap-4 items-center w-full">
-                              <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-lg shadow-inner ${dynamicStatus === 'ORDERED' || dynamicStatus === 'RUNNING' ? 'bg-emerald-50 text-emerald-600' :
+                              <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-lg shadow-inner ${
+                                dynamicStatus === 'RUNNING_OUTSOURCING_CONTRACT' ? 'bg-purple-50 text-purple-600 border border-purple-200' :
+                                dynamicStatus === 'ORDERED' || dynamicStatus === 'RUNNING' ? 'bg-emerald-50 text-emerald-600' :
                                 dynamicStatus === 'WAITING_CONTRACT_START' ? 'bg-purple-50 text-purple-600' :
-                                  dynamicStatus === 'AWARDED' ? 'bg-amber-50 text-amber-600' :
-                                    dynamicStatus === 'GRACE_PERIOD' ? 'bg-rose-50 text-rose-600' : 'bg-white text-blue-500 shadow-sm'
+                                dynamicStatus === 'AWARDED' ? 'bg-amber-50 text-amber-600' :
+                                dynamicStatus === 'GRACE_PERIOD' ? 'bg-rose-50 text-rose-600' : 'bg-white text-blue-500 shadow-sm'
                                 }`}>
-                                <i className={`fa-solid ${dynamicStatus === 'ORDERED' || dynamicStatus === 'RUNNING' ? 'fa-truck-fast' : dynamicStatus === 'WAITING_CONTRACT_START' ? 'fa-calendar-check' : dynamicStatus === 'AWARDED' ? 'fa-file-signature' : dynamicStatus === 'GRACE_PERIOD' ? 'fa-hourglass-end' : 'fa-diagram-project'}`}></i>
+                                <i className={`fa-solid ${
+                                  dynamicStatus === 'RUNNING_OUTSOURCING_CONTRACT' ? 'fa-handshake-angle' :
+                                  dynamicStatus === 'ORDERED' || dynamicStatus === 'RUNNING' ? 'fa-truck-fast' :
+                                  dynamicStatus === 'WAITING_CONTRACT_START' ? 'fa-calendar-check' :
+                                  dynamicStatus === 'AWARDED' ? 'fa-file-signature' :
+                                  dynamicStatus === 'GRACE_PERIOD' ? 'fa-hourglass-end' : 'fa-diagram-project'
+                                }`}></i>
                               </div>
                               <div>
                                 <div className="flex items-center gap-2 flex-wrap">
                                   <span className="text-[10px] font-black text-blue-600 font-mono tracking-widest uppercase">{c.componentNumber}</span>
                                   {c.supplierPartNumber && <span className="text-[10px] font-black text-amber-600 font-mono tracking-widest uppercase border border-amber-200 bg-amber-50 px-1 rounded">MFR P/N: {c.supplierPartNumber}</span>}
-                                  <span className={`px-2 py-0.5 text-[8px] font-black rounded uppercase ${dynamicStatus === 'ORDERED' || dynamicStatus === 'RUNNING' ? 'bg-emerald-600 text-white' :
-                                    dynamicStatus === 'WAITING_CONTRACT_START' ? 'bg-purple-600 text-white' :
+                                  {dynamicStatus !== 'RUNNING_OUTSOURCING_CONTRACT' && (
+                                    <span className={`px-2 py-0.5 text-[8px] font-black rounded uppercase ${
+                                      dynamicStatus === 'ORDERED' || dynamicStatus === 'RUNNING' ? 'bg-emerald-600 text-white' :
+                                      dynamicStatus === 'WAITING_CONTRACT_START' ? 'bg-purple-600 text-white' :
                                       dynamicStatus === 'AWARDED' ? 'bg-amber-600 text-white' :
-                                        dynamicStatus === 'GRACE_PERIOD' ? 'bg-rose-600 text-white' : 'bg-slate-900 text-white'
+                                      dynamicStatus === 'GRACE_PERIOD' ? 'bg-rose-600 text-white' : 'bg-slate-900 text-white'
                                     }`}>{dynamicStatus.replace(/_/g, ' ')}</span>
+                                  )}
                                   {c.rfpId && ['RFP_SENT', 'AWARDED'].includes(c.status || '') && (
                                     <span className="text-[9px] font-black text-blue-600 uppercase border border-blue-200 bg-blue-50 px-2 rounded ml-1" title="RFP Batch Group">
                                       BATCH: {c.rfpId.substring(0, 6)}
                                     </span>
                                   )}
-                                  {activeTab === 'outsourcing' && c.status === 'PENDING_OFFER' && (
+                                  {c.cancellationReason && c.status === 'PENDING_OFFER' && (
+                                    <span className="text-[9px] font-black text-rose-700 uppercase border border-rose-200 bg-rose-50 px-2 py-0.5 rounded ml-1" title={`PO Cancelled: ${c.cancellationReason}`}>
+                                      <i className="fa-solid fa-ban mr-1"></i>
+                                      PO CANCELLED {c.cancelledPoNumber ? `(${c.cancelledPoNumber})` : ''}
+                                    </span>
+                                  )}
+                                  {c.revertReason && c.status === 'AWARDED' && (
+                                    <span className="text-[9px] font-black text-amber-700 uppercase border border-amber-200 bg-amber-50 px-2 py-0.5 rounded ml-1" title={`Reverted from PO: ${c.revertReason}`}>
+                                      <i className="fa-solid fa-rotate-left mr-1"></i>
+                                      REVERTED FROM PO {c.revertedPoNumber ? `(${c.revertedPoNumber})` : ''}
+                                    </span>
+                                  )}
+                                  {activeTab === 'outsourcing' && (c.status === 'PENDING_OFFER' || c.status === 'RUNNING_OUTSOURCING_CONTRACT' || isCompNoRfp(o, i, c)) && (
                                     <label
                                       onClick={(e) => e.stopPropagation()}
                                       className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[8px] font-black uppercase cursor-pointer transition-all ${
@@ -2561,7 +2963,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                           ? 'bg-amber-50 border-amber-200 text-amber-800'
                                           : 'bg-slate-50 border-slate-200 text-slate-400 hover:border-slate-300'
                                       }`}
-                                      title="Direct award tender without sending RFPs"
+                                      title="No RFP needed for outsourcing contract"
                                     >
                                       <input
                                         type="checkbox"
@@ -2598,8 +3000,31 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                   <span>{t('procurement.component.item')}: {i.orderNumber}</span>
                                   <span>•</span>
                                   <span>{t('procurement.component.orderedQty')}: {c.quantity} {c.unit}</span>
-                                  <span>•</span>
-                                  <span>{t('procurement.component.cost')}: {(c.unitCost || 0).toLocaleString()} L.E.</span>
+                                  {(c.workingResourceCount || i.workingResourceCount) ? (
+                                    <>
+                                      <span>•</span>
+                                      <span className="text-emerald-700 font-black">
+                                        <i className="fa-solid fa-users mr-1"></i>
+                                        {c.workingResourceCount || i.workingResourceCount} Resources
+                                      </span>
+                                    </>
+                                  ) : null}
+                                  {(c.realCost || i.realCost) ? (
+                                    <>
+                                      <span>•</span>
+                                      <span className="text-blue-700 font-black">
+                                        <i className="fa-solid fa-coins mr-1"></i>
+                                        {(c.realCost || i.realCost || 0).toLocaleString()} L.E. Real Cost
+                                      </span>
+                                    </>
+                                  ) : (
+                                    c.unitCost ? (
+                                      <>
+                                        <span>•</span>
+                                        <span>{t('procurement.component.cost')}: {(c.unitCost || 0).toLocaleString()} L.E.</span>
+                                      </>
+                                    ) : null
+                                  )}
                                   {c.receivedQty !== undefined && c.receivedQty > 0 && (
                                     <>
                                       <span className="text-emerald-600 font-black">• {t('procurement.component.received')}: {c.receivedQty}</span>
@@ -2608,7 +3033,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                   )}
                                   {c.supplierId && (
                                     <span className="text-blue-600">
-                                      • {t('procurement.component.supplier')}: {suppliers.find(s => s.id === c.supplierId)?.name || t('procurement.component.unknown')}
+                                      • {t('procurement.component.supplier')}: {formatSupplierName(suppliers.find(s => s.id === c.supplierId)) || c.supplierName || t('procurement.component.unknown')}
                                     </span>
                                   )}
                                 </div>
@@ -2668,40 +3093,55 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                     </button>
                                   </div>
 
-                                  {c.status === 'PENDING_OFFER' && (
+                                   {/* When isCompNoRfp is true, Send RFP and Award Tender are completely bypassed */}
+                                   {(c.status === 'PENDING_OFFER' || c.status === 'RUNNING_OUTSOURCING_CONTRACT') && !isCompNoRfp(o, i, c) && (
+                                     <div className="flex items-center gap-2 flex-wrap">
+                                       <button onClick={() => {
+                                         setActiveAction({ type: 'RFP', order: o, item: i, comp: c });
+                                         setRfpSelection(c.rfpSupplierIds || []);
+                                         // Auto-select other components with the same rfpId if it exists
+                                         const sameRfpIds = c.rfpId ? comps.filter(x => x.comp.rfpId === c.rfpId).map(x => x.comp.id!) : [c.id!];
+                                         setRfpCompSelection(sameRfpIds);
+                                       }}
+                                         className="px-4 py-2 rounded-lg text-[9px] font-black uppercase shadow-sm transition-all bg-slate-900 text-white hover:bg-black"
+                                       >{t('procurement.rfp.sendRfp')}</button>
+                                     </div>
+                                   )}
+
+                                   {/* If outsourcing with No RFP Needed */}
+                                   {isCompNoRfp(o, i, c) && (
                                     <div className="flex items-center gap-2 flex-wrap">
-                                      {/* Direct Award button if No RFP Needed is checked */}
-                                      {isCompNoRfp(o, i, c) && (
+                                      {(c.costSheetFile || i.costSheetFile) && (
                                         <button
-                                          onClick={() => {
-                                            const samePending = comps.filter(x => x.comp.status === 'PENDING_OFFER' || x.comp.status === 'RFP_SENT');
-                                            const displayComps = samePending.length > 0 ? samePending : [comps.find(x => x.comp.id === c.id)!];
-                                            setMultiComps(displayComps);
-                                            setSelectedCompIds([c.id!]);
-                                            setActiveAction({ type: 'AWARD', order: o, item: i, comp: c });
-                                            setAwardCosts({ [c.id!]: (c.unitCost || 0).toString() });
-                                            setAwardTaxPercent((c.taxPercent || 14).toString());
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            const file = c.costSheetFile || i.costSheetFile;
+                                            const fileName = c.costSheetFileName || i.costSheetFileName || 'CostSheet.xlsx';
+                                            const link = document.createElement('a');
+                                            link.href = file!;
+                                            link.download = fileName;
+                                            document.body.appendChild(link);
+                                            link.click();
+                                            document.body.removeChild(link);
                                           }}
-                                          className="px-4 py-2 bg-amber-600 text-white rounded-lg text-[9px] font-black uppercase shadow-sm hover:bg-amber-700 transition-all flex items-center gap-1.5"
-                                          title="Direct award tender (Cost Sheet uploaded - no RFP needed)"
+                                          className="px-3 py-1.5 bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 rounded-lg text-[9px] font-black uppercase shadow-xs transition-all flex items-center gap-1.5 cursor-pointer"
+                                          title="Download attached Excel cost sheet"
                                         >
-                                          <i className="fa-solid fa-award"></i> {t('procurement.rfp.awardTender')}
+                                          <i className="fa-solid fa-file-excel text-emerald-600"></i>
+                                          <span>{t('procurement.outsourcingCard.downloadSheet') || 'Download'}</span>
                                         </button>
                                       )}
-
-                                      <button onClick={() => {
-                                        setActiveAction({ type: 'RFP', order: o, item: i, comp: c });
-                                        setRfpSelection(c.rfpSupplierIds || []);
-                                        // Auto-select other components with the same rfpId if it exists
-                                        const sameRfpIds = c.rfpId ? comps.filter(x => x.comp.rfpId === c.rfpId).map(x => x.comp.id!) : [c.id!];
-                                        setRfpCompSelection(sameRfpIds);
-                                      }}
-                                        className={`px-4 py-2 rounded-lg text-[9px] font-black uppercase shadow-sm transition-all ${
-                                          isCompNoRfp(o, i, c)
-                                            ? 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
-                                            : 'bg-slate-900 text-white hover:bg-black'
-                                        }`}
-                                      >{t('procurement.rfp.sendRfp')}</button>
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          openCostSheetModal(o);
+                                        }}
+                                        className="px-3 py-1.5 bg-violet-50 border border-violet-200 text-violet-700 hover:bg-violet-100 rounded-lg text-[9px] font-black uppercase shadow-xs transition-all flex items-center gap-1.5 cursor-pointer"
+                                        title="Open spreadsheet viewer"
+                                      >
+                                        <i className="fa-solid fa-table-cells text-violet-600"></i>
+                                        <span>{t('procurement.outsourcingCard.viewSheet') || 'View Sheet'}</span>
+                                      </button>
                                     </div>
                                   )}
                                   {c.status === 'RFP_SENT' && (
@@ -2718,6 +3158,8 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                         setMultiComps(displayComps);
                                         setSelectedCompIds([c.id!]); // Default to only current one selected
                                         setActiveAction({ type: 'AWARD', order: o, item: i, comp: c });
+                                        const initialRfpSuppliers = c.rfpSupplierIds || (sameRfp.length > 0 ? sameRfp.find(x => x.comp.rfpSupplierIds?.length)?.comp.rfpSupplierIds : []);
+                                        setAwardSupplierId(c.supplierId || (initialRfpSuppliers?.length === 1 ? initialRfpSuppliers[0] : ''));
                                         setAwardCosts({ [c.id!]: (c.unitCost || 0).toString() });
                                         setAwardTaxPercent((c.taxPercent || 14).toString());
                                       }}
@@ -2725,7 +3167,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                       >{t('procurement.rfp.awardTender')}</button>
                                     </div>
                                   )}
-                                  {c.status === 'AWARDED' && (
+                                  {c.status === 'AWARDED' && !isCompNoRfp(o, i, c) && (
                                     <div className="flex flex-col items-end gap-1.5">
                                       <div className="flex items-center gap-2">
                                         {!allOrderProcurementAwarded && (
@@ -2803,6 +3245,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                       </button>
                                       <button
                                         onClick={() => {
+                                          setResetReason('');
                                           setActiveAction({ type: 'REVERT_PO', order: o, item: i, comp: c });
                                         }}
                                         disabled={isActionLoading != null}
@@ -2843,6 +3286,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                       </button>
                                       <button
                                         onClick={() => {
+                                          setResetReason('');
                                           setActiveAction({ type: 'REVERT_PO', order: o, item: i, comp: c });
                                         }}
                                         disabled={isActionLoading != null}
@@ -2959,7 +3403,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                               })
                               .flatMap(ci => (ci.components || []).filter(cc =>
                                 cc.source === 'PROCUREMENT' &&
-                                (['PENDING_OFFER', 'RFP_SENT'].includes(cc.status || ''))
+                                (['PENDING_OFFER', 'RFP_SENT', 'RUNNING_OUTSOURCING_CONTRACT'].includes(cc.status || ''))
                               )).map(comp => (
                                 <label key={comp.id} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${rfpCompSelection.includes(comp.id || '') ? 'bg-blue-600 text-white border-blue-700 shadow-md' : 'bg-slate-50 border-slate-100 hover:border-slate-300'}`}>
                                   <input
@@ -3000,17 +3444,38 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                         <div className="space-y-3 pt-4 border-t border-slate-100">
                           <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">{t('procurement.rfp.selectTargetSuppliers')}</label>
                           <p className="text-[9px] text-slate-400 font-bold uppercase ml-1 -mt-1 mb-2">{t('procurement.rfp.selectTargetSuppliersHint')}</p>
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-48 overflow-y-auto p-1 custom-scrollbar">
-                            {suppliers.map(s => (
-                              <button
-                                key={s.id}
-                                onClick={() => setRfpSelection(prev => prev.includes(s.id) ? prev.filter(x => x !== s.id) : [...prev, s.id])}
-                                className={`p-4 rounded-2xl border text-left transition-all flex items-center justify-between ${rfpSelection.includes(s.id) ? 'bg-blue-600 text-white border-blue-700 shadow-lg' : 'bg-slate-50 text-slate-700 border-slate-100 hover:border-blue-200'}`}
-                              >
-                                <span className="text-xs font-black uppercase tracking-tight">{s.name}</span>
-                                {rfpSelection.includes(s.id) && <i className="fa-solid fa-circle-check"></i>}
-                              </button>
-                            ))}
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-60 overflow-y-auto p-1 custom-scrollbar">
+                            {suppliers.map(s => {
+                              const isSelected = rfpSelection.includes(s.id!);
+                              const contact = s.contactName && s.contactName.trim() !== s.name?.trim() ? s.contactName.trim() : '';
+                              const phone = s.contactPhone || s.phone;
+                              return (
+                                <button
+                                  type="button"
+                                  key={s.id}
+                                  onClick={() => setRfpSelection(prev => prev.includes(s.id!) ? prev.filter(x => x !== s.id) : [...prev, s.id!])}
+                                  className={`p-3 rounded-2xl border text-left transition-all flex items-start justify-between gap-2 ${isSelected ? 'bg-blue-600 text-white border-blue-700 shadow-lg' : 'bg-slate-50 text-slate-700 border-slate-100 hover:border-blue-200'}`}
+                                >
+                                  <div className="flex flex-col min-w-0">
+                                    <span className="text-xs font-black uppercase tracking-tight truncate">{s.name}</span>
+                                    {contact && (
+                                      <span className={`text-[11px] font-bold flex items-center gap-1 mt-0.5 ${isSelected ? 'text-blue-100' : 'text-slate-600'}`}>
+                                        <i className="fa-solid fa-user text-[10px] opacity-70"></i>
+                                        <span className="truncate">{contact}</span>
+                                      </span>
+                                    )}
+                                    {phone && (
+                                      <span className={`text-[10px] font-mono mt-0.5 ${isSelected ? 'text-blue-200' : 'text-slate-400'}`}>
+                                        <i className="fa-solid fa-phone text-[9px] mr-1 opacity-70"></i>{phone}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="pt-1 shrink-0">
+                                    {isSelected ? <i className="fa-solid fa-circle-check text-base"></i> : <i className="fa-regular fa-circle text-base opacity-30"></i>}
+                                  </div>
+                                </button>
+                              );
+                            })}
                           </div>
                         </div>
                       </>
@@ -3074,15 +3539,102 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                         )}
 
                         <div className="space-y-4">
-                          <div className="space-y-1.5">
-                            <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">{t('procurement.award.awardVendor')}</label>
-                            <select
-                              className="w-full p-4 bg-slate-50 border-2 border-slate-100 rounded-2xl font-bold text-sm outline-none focus:bg-white focus:border-blue-500 transition-all"
-                              value={awardSupplierId} onChange={e => setAwardSupplierId(e.target.value)}
-                            >
-                              <option value="">{t('procurement.award.selectVendor')}</option>
-                              {awardSuppliersList.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                            </select>
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">
+                                {t('procurement.award.awardVendor')}
+                              </label>
+                              <span className={`text-[9px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider ${
+                                isFilteredByRfp
+                                  ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                                  : 'bg-slate-100 text-slate-600 border border-slate-200'
+                              }`}>
+                                <i className={`fa-solid ${isFilteredByRfp ? 'fa-filter' : 'fa-list'} mr-1 text-[8px]`}></i>
+                                {isFilteredByRfp ? t('procurement.award.rfpVendorsOnly') : t('procurement.award.allVendorsFallback')}
+                              </span>
+                            </div>
+
+                            {/* Vendor selection cards */}
+                            {awardSuppliersList.length > 0 ? (
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 max-h-56 overflow-y-auto p-1 custom-scrollbar">
+                                {awardSuppliersList.map(s => {
+                                  const isSelected = awardSupplierId === s.id;
+                                  const contact = s.contactName && s.contactName.trim() !== s.name?.trim() ? s.contactName.trim() : '';
+                                  const phone = s.contactPhone || s.phone;
+                                  const location = s.location || s.address;
+                                  return (
+                                    <button
+                                      type="button"
+                                      key={s.id}
+                                      onClick={() => setAwardSupplierId(s.id || '')}
+                                      className={`p-3.5 rounded-2xl border text-left transition-all flex flex-col justify-between gap-2 relative ${
+                                        isSelected
+                                          ? 'bg-emerald-50 border-emerald-500 text-emerald-950 shadow-md ring-2 ring-emerald-500/20'
+                                          : 'bg-slate-50 text-slate-700 border-slate-100 hover:border-blue-200 hover:bg-slate-50/80'
+                                      }`}
+                                    >
+                                      <div className="flex items-start justify-between w-full gap-2">
+                                        <div className="min-w-0 flex-1">
+                                          <div className="text-xs font-black uppercase tracking-tight truncate text-slate-900">
+                                            {s.name}
+                                          </div>
+                                          {contact && (
+                                            <div className="text-[11px] font-bold text-slate-700 flex items-center gap-1.5 mt-1">
+                                              <i className="fa-solid fa-user-tie text-[10px] text-blue-600"></i>
+                                              <span className="truncate">{contact}</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                        <div className="shrink-0 mt-0.5">
+                                          {isSelected ? (
+                                            <i className="fa-solid fa-circle-check text-emerald-600 text-lg"></i>
+                                          ) : (
+                                            <i className="fa-regular fa-circle text-slate-300 text-lg"></i>
+                                          )}
+                                        </div>
+                                      </div>
+
+                                      {(phone || location) && (
+                                        <div className="flex items-center flex-wrap gap-x-3 gap-y-1 text-[10px] text-slate-400 border-t border-slate-200/50 pt-1.5 font-medium">
+                                          {phone && (
+                                            <span className="flex items-center gap-1 font-mono text-slate-600">
+                                              <i className="fa-solid fa-phone text-[9px] text-slate-400"></i>
+                                              {phone}
+                                            </span>
+                                          )}
+                                          {location && (
+                                            <span className="flex items-center gap-1 truncate text-slate-500 max-w-[180px]">
+                                              <i className="fa-solid fa-location-dot text-[9px] text-slate-400"></i>
+                                              <span className="truncate">{location}</span>
+                                            </span>
+                                          )}
+                                        </div>
+                                      )}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold text-center">
+                                {t('procurement.award.noVendorsFound')}
+                              </div>
+                            )}
+
+                            {/* Dropdown for quick access / fallback */}
+                            <div className="pt-1">
+                              <select
+                                className="w-full p-3 bg-white border border-slate-200 rounded-xl font-bold text-xs text-slate-700 outline-none focus:border-blue-500 transition-all"
+                                value={awardSupplierId}
+                                onChange={e => setAwardSupplierId(e.target.value)}
+                              >
+                                <option value="">{t('procurement.award.selectVendor')}</option>
+                                {awardSuppliersList.map(s => (
+                                  <option key={s.id} value={s.id}>
+                                    {formatSupplierName(s)}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
                           </div>
 
                           <div className="grid grid-cols-1 gap-4">
@@ -3121,7 +3673,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                           <div>
                             <div className="text-[10px] font-black text-blue-400 uppercase tracking-widest">{t('procurement.po.targetSupplier')}</div>
                             <div className="text-lg font-black text-blue-900 uppercase tracking-tight">
-                              {suppliers.find(s => s.id === (multiComps[0]?.comp.supplierId || activeAction.comp?.supplierId))?.name || 'Unknown Supplier'}
+                              {formatSupplierName(suppliers.find(s => s.id === (multiComps[0]?.comp.supplierId || activeAction.comp?.supplierId))) || 'Unknown Supplier'}
                             </div>
                           </div>
                           <div className="text-right">
@@ -3267,6 +3819,19 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                             <i className="fa-solid fa-triangle-exclamation mr-2"></i>
                             {t('procurement.revertPO.noteRevert')}
                           </p>
+                          <div className="space-y-1.5 pt-2">
+                            <label className="text-[9px] font-black text-amber-700 uppercase flex items-center justify-between">
+                              <span>{t('procurement.revertPO.reasonForRevert')}</span>
+                              <span className="text-[8px] text-amber-500 font-normal">{t('procurement.revertPO.mandatoryReason')}</span>
+                            </label>
+                            <textarea
+                              className="w-full p-4 bg-white border border-amber-200 rounded-2xl text-sm font-bold outline-none focus:ring-4 focus:ring-amber-100 placeholder:text-slate-300"
+                              placeholder={t('procurement.revertPO.reasonPlaceholder')}
+                              rows={3}
+                              value={resetReason}
+                              onChange={e => setResetReason(e.target.value)}
+                            />
+                          </div>
                         </div>
                       </div>
                     )}

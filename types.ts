@@ -32,7 +32,8 @@ export enum OrderStatus {
   HUB_RELEASED = 'HUB_RELEASED',
   DELIVERED = 'DELIVERED',
   WAITING_GOVE = 'WAITING_GOVE',
-  FULFILLED = 'FULFILLED'
+  FULFILLED = 'FULFILLED',
+  RUNNING_OUTSOURCING_CONTRACT = 'RUNNING_OUTSOURCING_CONTRACT'
 }
 
 export type UserRole = 'admin' | 'management' | 'order_management' | 'factory' | 'procurement' | 'finance' | 'crm' | 'inventory' | 'Gov.EInvoice' | 'planning' | 'suppliers' | 'shipment' | 'sales' | 'warehouse' | 'logistics';
@@ -191,7 +192,7 @@ export interface LedgerEntry {
   user: string;
 }
 
-export type CompStatus = 'AVAILABLE' | 'PENDING_OFFER' | 'RFP_SENT' | 'AWARDED' | 'ORDERED' | 'ORDERED_FOR_STOCK' | 'WAITING_CONTRACT_START' | 'RECEIVED' | 'RESERVED' | 'IN_MANUFACTURING' | 'MANUFACTURED' | 'CANCELLED';
+export type CompStatus = 'AVAILABLE' | 'PENDING_OFFER' | 'RFP_SENT' | 'AWARDED' | 'ORDERED' | 'ORDERED_FOR_STOCK' | 'WAITING_CONTRACT_START' | 'RUNNING_OUTSOURCING_CONTRACT' | 'RECEIVED' | 'RESERVED' | 'IN_MANUFACTURING' | 'MANUFACTURED' | 'CANCELLED';
 
 export interface ReplacementRequest {
   id: string;
@@ -200,6 +201,18 @@ export interface ReplacementRequest {
   originalStartDate: string;
   newStartDate: string;
   remainingDuration: string;
+}
+
+export interface CostSheetRecord {
+  id: string;
+  fileName: string;
+  uploadedAt: string;
+  fileData?: string;
+  workingResourceCount?: number;
+  realCost?: number;
+  invoiceTotal?: number;
+  monthLabel?: string;
+  notes?: string;
 }
 
 export interface ManufacturingComponent {
@@ -214,6 +227,7 @@ export interface ManufacturingComponent {
   source: 'STOCK' | 'PROCUREMENT';
   inventoryItemId?: string;
   supplierId?: string;
+  supplierName?: string;
   supplierPartId?: string;
   supplierPartNumber?: string;
   rfpSupplierIds?: string[];
@@ -231,6 +245,17 @@ export interface ManufacturingComponent {
   contractStartDate?: string;
   originalStartDate?: string;
   replacementHistory?: ReplacementRequest[];
+  cancellationReason?: string;
+  revertReason?: string;
+  lastAction?: string;
+  lastActionComment?: string;
+  cancelledPoNumber?: string;
+  revertedPoNumber?: string;
+  noRfpNeeded?: boolean;
+  costSheets?: CostSheetRecord[];
+  workingResourceCount?: number;
+  realCost?: number;
+  invoiceTotal?: number;
 }
 
 
@@ -259,6 +284,11 @@ export interface CustomerOrderItem {
   costSheetText?: string;
   costSheetEditableCells?: string[];
   costSheetCellColors?: Record<string, string>;
+  noRfpNeeded?: boolean;
+  costSheets?: CostSheetRecord[];
+  workingResourceCount?: number;
+  realCost?: number;
+  invoiceTotal?: number;
 }
 
 export interface InventoryItem {
@@ -366,6 +396,25 @@ export interface Contract {
 export interface HelpLink {
   url: string;
   description: string;
+}
+
+/**
+ * Machine / ERP Test Tool API key. The full secret (`key`) is returned ONLY in
+ * the create response and is never stored or served back in plaintext.
+ */
+export interface ApiKey {
+  id: string;
+  name: string;
+  /** Owner user the key authenticates as. */
+  username: string;
+  /** Leading characters of the secret, for display/identification. */
+  prefix: string;
+  createdAt: string;
+  createdBy: string;
+  lastUsedAt?: string | null;
+  enabled: boolean;
+  /** Present only on the create response. */
+  key?: string;
 }
 
 export interface OpenAIConfig {
@@ -486,6 +535,8 @@ export const getItemEffectiveStatus = (item: CustomerOrderItem): string => {
   const comps = item.components || [];
   if (comps.length === 0) return 'NO_COMPONENTS';
   const statuses = comps.map(c => c.status || 'NEW');
+  // If any component is running outsourcing contract
+  if (statuses.some(s => s === 'RUNNING_OUTSOURCING_CONTRACT')) return 'RUNNING_OUTSOURCING_CONTRACT';
   // If any component still needs procurement action
   if (statuses.some(s => ['PENDING_OFFER', 'RFP_SENT', 'AWARDED', 'ORDERED', 'WAITING_CONTRACT_START'].includes(s))) return 'WAITING_SUPPLIERS';
   // If all components are reserved/received (ready to manufacture)

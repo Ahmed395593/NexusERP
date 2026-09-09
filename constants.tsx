@@ -3,7 +3,7 @@ import { AppConfig, OrderStatus, Customer, InventoryItem, Supplier, User, UserGr
 import { getItemEffectiveQty } from './utils';
 
 // Application Version - Increment by 0.000001 for every code update
-export const APP_VERSION = '1.0001016';
+export const APP_VERSION = '1.0001025';
 
 export const INITIAL_CONFIG: AppConfig = {
   modules: {
@@ -188,7 +188,8 @@ export const STATUS_CONFIG: Record<OrderStatus, { label: string, color: string, 
   [OrderStatus.HUB_RELEASED]: { label: 'In Transit', color: 'indigo', icon: 'fa-truck-fast' },
   [OrderStatus.DELIVERED]: { label: 'Delivered', color: 'emerald', icon: 'fa-box-check' },
   [OrderStatus.WAITING_GOVE]: { label: 'Waiting Gov.E', color: 'yellow', icon: 'fa-file-invoice' },
-  [OrderStatus.FULFILLED]: { label: 'Fulfilled', color: 'emerald', icon: 'fa-check-double' }
+  [OrderStatus.FULFILLED]: { label: 'Fulfilled', color: 'emerald', icon: 'fa-check-double' },
+  [OrderStatus.RUNNING_OUTSOURCING_CONTRACT]: { label: 'Running Contract', color: 'purple', icon: 'fa-handshake-angle' }
 };
 
 export const getDynamicOrderStatusStyle = (order: CustomerOrder, config: AppConfig): { label: string, color: string, icon: string } => {

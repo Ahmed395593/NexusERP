@@ -9,6 +9,7 @@ import fs from 'fs';
 
 import os from 'os';
 import AdmZip from 'adm-zip';
+import * as XLSX from 'xlsx';
 
 // Path sanitization with safe fallback
 const sanitizeUsername = (username) => {
@@ -103,7 +104,7 @@ const syncAuthoritativeUsersToSandboxes = (liveDb) => {
 
 const SERVER_START_TIME = Date.now();
 const FACTORY_PASS = 'YousefNadody!@#2';
-const CURRENT_SCHEMA_VERSION = 4; // Increment when introducing new schema migrations
+const CURRENT_SCHEMA_VERSION = 6; // Increment when introducing new schema migrations
 const FORCE_SCHEMA_MIGRATION = process.env.FORCE_SCHEMA_MIGRATION === 'true';
 
 const getItemEffectiveQty = (item) => {
@@ -190,7 +191,8 @@ const OrderStatus = {
     HUB_RELEASED: 'HUB_RELEASED',
     DELIVERED: 'DELIVERED',
     WAITING_GOVE: 'WAITING_GOVE',
-    FULFILLED: 'FULFILLED'
+    FULFILLED: 'FULFILLED',
+    RUNNING_OUTSOURCING_CONTRACT: 'RUNNING_OUTSOURCING_CONTRACT'
 };
 
 // Per-item effective status: determines what workflow stage a line item is in based on its components
@@ -198,6 +200,8 @@ const getItemEffectiveStatus = (item) => {
     const comps = item.components || [];
     if (comps.length === 0) return 'NO_COMPONENTS';
     const statuses = comps.map(c => c.status || 'NEW');
+    // If any component is running outsourcing contract
+    if (statuses.some(s => s === 'RUNNING_OUTSOURCING_CONTRACT')) return 'RUNNING_OUTSOURCING_CONTRACT';
     // If any component still needs procurement action
     if (statuses.some(s => ['PENDING_OFFER', 'RFP_SENT', 'AWARDED', 'ORDERED', 'WAITING_CONTRACT_START'].includes(s))) return 'WAITING_SUPPLIERS';
     // If all components are reserved/received (ready to manufacture)
@@ -207,6 +211,86 @@ const getItemEffectiveStatus = (item) => {
     // If all are manufactured
     if (statuses.every(s => ['MANUFACTURED', 'CANCELLED'].includes(s))) return 'MANUFACTURED';
     return 'MIXED';
+};
+
+const extractCostSheetMetrics = (base64Data) => {
+    if (!base64Data) return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+    try {
+        const cleanBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
+        const wb = XLSX.read(cleanBase64, { type: 'base64' });
+        const sheetName = wb.SheetNames[0];
+        if (!sheetName) return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+        const sheet = wb.Sheets[sheetName];
+        const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+        let salaryTotalCol = -1;
+        let invoiceTotalCol = -1;
+        let nameCol = 0;
+
+        // Scan top 5 rows for column headers
+        for (let r = 0; r < Math.min(5, data.length); r++) {
+            const row = data[r] || [];
+            for (let c = 0; c < row.length; c++) {
+                const val = String(row[c] || '').trim();
+                if ((val.includes('المرتب') || val.includes('مرتب')) && (val.includes('اجمال') || val.includes('إجمال') || val.includes('صافي') || val.includes('قيمه') || val.includes('قيمة'))) {
+                    if (salaryTotalCol === -1 || val.includes('اجمال') || val.includes('إجمال')) {
+                        salaryTotalCol = c;
+                    }
+                }
+                if ((val.includes('الفاتور') || val.includes('فاتور')) && (val.includes('اجمال') || val.includes('إجمال') || val.includes('صافي') || val.includes('قيمه') || val.includes('قيمة'))) {
+                    if (invoiceTotalCol === -1 || val.includes('اجمال') || val.includes('إجمال')) {
+                        invoiceTotalCol = c;
+                    }
+                }
+                if (val === 'الاسم' || val === 'اسم' || val.toLowerCase() === 'name') {
+                    nameCol = c;
+                }
+            }
+        }
+
+        let resourceCount = 0;
+        let realCost = 0;
+        let invoiceTotal = 0;
+
+        for (let r = 0; r < data.length; r++) {
+            const row = data[r] || [];
+            const cell0 = String(row[nameCol] || '').trim();
+            if (!cell0) continue;
+
+            const isSummaryOrHeader = 
+                cell0.includes('اجمال') || cell0.includes('إجمال') ||
+                cell0.includes('مجموع') || cell0.includes('المجموع') ||
+                cell0.includes('صافي') || cell0.includes('الصافي') ||
+                /^(الاسم|اسم|name|كشف|بيان|تقرير|report|sheet)/i.test(cell0) ||
+                cell0.toLowerCase().includes('total') ||
+                cell0.toLowerCase().includes('subtotal') ||
+                cell0.toLowerCase().includes('summary');
+
+            if (isSummaryOrHeader) {
+                if (cell0.includes('اجمال') || cell0.includes('إجمال') || cell0.toLowerCase().includes('total')) {
+                    const numSalary = typeof row[salaryTotalCol] === 'number' ? row[salaryTotalCol] : parseFloat(String(row[salaryTotalCol] || '').replace(/,/g, ''));
+                    if (!isNaN(numSalary) && numSalary > realCost) {
+                        realCost = numSalary;
+                    }
+                    const numInv = typeof row[invoiceTotalCol] === 'number' ? row[invoiceTotalCol] : parseFloat(String(row[invoiceTotalCol] || '').replace(/,/g, ''));
+                    if (!isNaN(numInv) && numInv > invoiceTotal) {
+                        invoiceTotal = numInv;
+                    }
+                }
+            } else {
+                resourceCount++;
+            }
+        }
+
+        return {
+            resourceCount,
+            realCost: Math.round(realCost * 100) / 100,
+            invoiceTotal: Math.round(invoiceTotal * 100) / 100
+        };
+    } catch (e) {
+        console.error("[CostSheet] Extraction error:", e.message);
+        return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+    }
 };
 
 const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 1, isBlanketOrder = false) => {
@@ -403,7 +487,136 @@ const writeDb = (data, customPath = null) => {
 
 const getDb = (req) => readDb(getDbPath(req));
 // --- HELPERS ---
+// NOTE: hashPassword uses SHA-256, which is acceptable for this app's
+// pre-existing password storage but is NOT a slow KDF. Migrating to
+// bcrypt/scrypt/argon2 is a separate project (would invalidate all existing
+// user passwords on next login). New API keys use scrypt (below) since the
+// key shape and migration scope is contained to this feature.
 const hashPassword = (pass) => crypto.createHash('sha256').update(pass).digest('hex');
+
+// --- API KEY HELPERS (machine / ERP Test Tool authentication) ---
+// API keys are stored hashed (scrypt, never in plaintext) in the LIVE database
+// `apiKeys` collection. A key is bound to an owner user, and the ERP Test Tool
+// presents it to /api/v1/login (or the x-api-key header) instead of a password.
+//
+// Security choices:
+//   - 256 bits of OS-CSPRNG entropy (`crypto.randomBytes(32)`) — brute-force infeasible.
+//   - Per-key random salt; stored as `scrypt$<saltHex>$<hashHex>` so we can rotate
+//     cost parameters without breaking older keys.
+//   - scrypt with N=2^15, r=8, p=1 — same default Node.js parameters.
+//   - Constant-time compare via `crypto.timingSafeEqual` to avoid timing leaks.
+//
+// Migration note: any pre-existing SHA-256 hex hash (no `scrypt$` prefix) is
+// still verifiable via the legacy path so a stale key created before this
+// hardening keeps working until the admin revokes it.
+const API_KEY_PREFIX = 'nex_';
+const API_KEY_SCRYPT_OPTS = { N: 1 << 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
+const API_KEY_SCRYPT_KEYLEN = 64;
+const SCRYPT_HASH_RE = /^scrypt\$([0-9a-f]+)\$([0-9a-f]+)$/;
+const makeApiKeyId = () => `apikey_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+const generateApiKey = () => `${API_KEY_PREFIX}${crypto.randomBytes(32).toString('base64url')}`;
+const hashApiKey = (key) => {
+    const salt = crypto.randomBytes(16);
+    const hash = crypto.scryptSync(String(key || ''), salt, API_KEY_SCRYPT_KEYLEN, API_KEY_SCRYPT_OPTS);
+    return `scrypt$${salt.toString('hex')}$${hash.toString('hex')}`;
+};
+const verifyApiKey = (key, stored) => {
+    if (!key || !stored || typeof stored !== 'string') return false;
+    const m = SCRYPT_HASH_RE.exec(stored);
+    if (m) {
+        const salt = Buffer.from(m[1], 'hex');
+        const expected = Buffer.from(m[2], 'hex');
+        const actual = crypto.scryptSync(String(key), salt, expected.length, API_KEY_SCRYPT_OPTS);
+        // timingSafeEqual requires equal-length buffers; lengths are guaranteed
+        // by using `expected.length` as the scrypt output size above.
+        return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+    }
+    // Legacy plain-SHA-256-hex hashes (pre-hardening). Constant-time compared
+    // against a fresh SHA-256 of the supplied secret.
+    const legacy = crypto.createHash('sha256').update(String(key)).digest('hex');
+    if (legacy.length !== stored.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(legacy, 'utf8'), Buffer.from(stored, 'utf8'));
+};
+
+// In-memory cache of the live `apiKeys` array. The auth middleware resolves
+// keys on every request; reading the entire db.json for each one was a
+// (a) DoS surface and (b) performance wall. Cache TTL is short (5 s) so
+// admin revoke / disable actions propagate quickly. The cache is also
+// invalidated synchronously by every CRUD endpoint below.
+const apiKeyCache = { lastLoaded: 0, list: [], ttlMs: 5_000 };
+const loadApiKeyCache = () => {
+    try {
+        const liveDb = readDb(DB_PATH);
+        apiKeyCache.list = Array.isArray(liveDb.apiKeys) ? liveDb.apiKeys : [];
+    } catch (e) {
+        // Don't crash the request path on a transient read failure — return
+        // an empty cache and let the next refresh retry.
+        apiKeyCache.list = [];
+    }
+    apiKeyCache.lastLoaded = Date.now();
+};
+const getApiKeyRecords = () => {
+    if (Date.now() - apiKeyCache.lastLoaded > apiKeyCache.ttlMs) {
+        loadApiKeyCache();
+    }
+    return apiKeyCache.list;
+};
+const invalidateApiKeyCache = () => { apiKeyCache.lastLoaded = 0; };
+
+// Resolve a live API-key secret to its stored record (null when unknown/disabled).
+// `touch` persists lastUsedAt (login path); the middleware hot-path skips it to
+// avoid rewriting the (large) live DB on every request.
+const findApiKeyBySecret = (secret, { touch = false } = {}) => {
+  if (!secret || typeof secret !== 'string') return null;
+  const trimmed = secret.trim();
+  const records = getApiKeyRecords();
+  // O(N) iterate; N is tiny (admin-curated) so this is fine. Constant-time
+  // verification via verifyApiKey() prevents timing leaks.
+  let found = null;
+  for (const rec of records) {
+      if (rec.enabled === false) continue;
+      if (verifyApiKey(trimmed, rec.keyHash)) { found = rec; break; }
+  }
+  if (!found) return null;
+  if (touch) {
+    // lastUsedAt update is throttled to once per hour per key, and is persisted
+    // through the cache-bypassing read+write path (we only mutate the DB when
+    // we actually need to flush).
+    const last = found.lastUsedAt ? Date.parse(found.lastUsedAt) : NaN;
+    if (!Number.isFinite(last) || (Date.now() - last) > 60 * 60 * 1000) {
+      try {
+        const liveDb = readDb(DB_PATH);
+        const list = liveDb.apiKeys || [];
+        const idx = list.findIndex(k => k.id === found.id);
+        if (idx !== -1) {
+            list[idx].lastUsedAt = new Date().toISOString();
+            liveDb.apiKeys = list;
+            if (writeDb(liveDb, DB_PATH)) {
+                found.lastUsedAt = list[idx].lastUsedAt;
+            }
+        }
+      } catch (e) { /* swallow — touch is best-effort */ }
+    }
+  }
+  return found;
+};
+
+// Admin gate for API-key management routes. The live DB is the authority even
+// when the caller is currently resolving through a sandbox.
+//
+// IMPORTANT: the multi-tenant middleware does NOT populate `req.roles` in live
+// mode (no `x-sandbox-owner`) — by design, to keep live mode a zero-disk-IO
+// pass-through. Any new admin-gated endpoint added to server.js MUST use this
+// helper (or its own live-DB lookup) instead of `req.roles.includes('admin')`,
+// which would silently deny every live caller.
+const isAdminUser = (req) => {
+  if ((req.roles || []).includes('admin')) return true;
+  const liveDb = readDb(DB_PATH);
+  const username = String(req.headers['x-user'] || req.user || '').trim();
+  if (!username) return false;
+  const user = (liveDb.users || []).find(u => u.username.toLowerCase() === username.toLowerCase());
+  return !!user && (user.roles || []).includes('admin');
+};
 
 // --- AES-256-CBC CIPHER FOR SENSITIVE SETTINGS ---
 const CIPHER_KEY = crypto.createHash('sha256').update(FACTORY_PASS).digest(); // 32 bytes
@@ -832,6 +1045,14 @@ const migrations = [
     (settings) => {
         return settings;
     },
+    // v4 → v5: Initialize apiKeys array if missing (PR #26: API Key support)
+    (settings) => {
+        return settings;
+    },
+    // v5 → v6: Outsourcing No RFP by default & Running Contract status
+    (settings) => {
+        return settings;
+    },
 ];
 
 const applySchemaMigrations = (db, targetPath = DB_PATH) => {
@@ -869,6 +1090,50 @@ const applySchemaMigrations = (db, targetPath = DB_PATH) => {
         }
         if (version === 4) {
             db.contracts = db.contracts || [];
+        }
+        if (version === 5) {
+            // PR #26 — API Key support. Idempotent: skip when already present.
+            db.apiKeys = db.apiKeys || [];
+        }
+        if (version === 6 && Array.isArray(db.orders)) {
+            let migratedOrders = 0;
+            db.orders.forEach(o => {
+                const hasOutsourcing = (o.items || []).some(it => it.productionType === 'OUTSOURCING');
+                if (hasOutsourcing) {
+                    (o.items || []).forEach(it => {
+                        if (it.productionType === 'OUTSOURCING') {
+                            if (it.noRfpNeeded === undefined) it.noRfpNeeded = true;
+                            if (it.costSheetFile && (!it.workingResourceCount || !it.realCost)) {
+                                try {
+                                    const m = extractCostSheetMetrics(it.costSheetFile);
+                                    it.workingResourceCount = m.resourceCount;
+                                    it.realCost = m.realCost;
+                                    it.invoiceTotal = m.invoiceTotal;
+                                } catch (e) {}
+                            }
+                            (it.components || []).forEach(c => {
+                                if (c.noRfpNeeded === undefined) c.noRfpNeeded = true;
+                                if (c.noRfpNeeded && ['PENDING_OFFER', 'NEW', undefined].includes(c.status)) {
+                                    c.status = 'RUNNING_OUTSOURCING_CONTRACT';
+                                }
+                                if (it.workingResourceCount) c.workingResourceCount = it.workingResourceCount;
+                                if (it.realCost) {
+                                    c.realCost = it.realCost;
+                                    if (!c.unitCost) c.unitCost = it.realCost;
+                                }
+                                if (it.invoiceTotal) c.invoiceTotal = it.invoiceTotal;
+                            });
+                        }
+                    });
+                    const allProcComps = o.items.flatMap(it => it.components || []).filter(c => c.source === 'PROCUREMENT');
+                    const anyNeedsRfp = allProcComps.some(c => !c.noRfpNeeded && ['NEW', 'PENDING_OFFER', 'RFP_SENT', 'AWARDED'].includes(c.status));
+                    if (!anyNeedsRfp && (o.status === OrderStatus.WAITING_SUPPLIERS || !o.status)) {
+                        o.status = OrderStatus.RUNNING_OUTSOURCING_CONTRACT;
+                        migratedOrders++;
+                    }
+                }
+            });
+            if (migratedOrders > 0) console.log(`[System] v5→v6 migration: updated ${migratedOrders} outsourcing order(s) to RUNNING_OUTSOURCING_CONTRACT.`);
         }
     }
 
@@ -1155,64 +1420,75 @@ const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipSta
             item.productionType = 'TRADING';
         }
 
-        if (item.productionType === 'TRADING') {
+        if (order.status !== OrderStatus.LOGGED) {
+            if (item.productionType === 'TRADING') {
 
-            // Ensure exactly one component that mirrors the item
-            if (!item.components || item.components.length === 0) {
-                const newComp = {
-                    id: `c_${Date.now()}_${idx}_0`,
-                    description: item.description,
-                    quantity: getItemEffectiveQty(item),
-                    unit: item.unit || 'pcs',
-                    unitCost: 0,
-                    taxPercent: 14,
-                    source: 'PROCUREMENT',
-                    status: 'PENDING_OFFER',
-                    componentNumber: `CMP-${order.internalOrderNumber}-${idx + 1}-1`
-                };
-                
-                // Automatic intelligence: search price list for match
-                const match = (db.suppliers || []).flatMap(s => s.priceList || []).find(p => String(p?.description || '').trim().toLowerCase() === String(item.description || '').trim().toLowerCase());
-                if (match) newComp.supplierPartNumber = match.partNumber;
-
-                item.components = [newComp];
-            } else {
-                // Mirror sync: Only the first component is active in TRADING
-                const comp = item.components[0];
-                if (comp.description !== item.description || comp.quantity !== getItemEffectiveQty(item)) {
-                    comp.description = item.description;
-                    comp.quantity = getItemEffectiveQty(item);
+                // Ensure exactly one component that mirrors the item
+                if (!item.components || item.components.length === 0) {
+                    const newComp = {
+                        id: `c_${Date.now()}_${idx}_0`,
+                        description: item.description,
+                        quantity: getItemEffectiveQty(item),
+                        unit: item.unit || 'pcs',
+                        unitCost: 0,
+                        taxPercent: 14,
+                        source: 'PROCUREMENT',
+                        status: 'PENDING_OFFER',
+                        componentNumber: `CMP-${order.internalOrderNumber}-${idx + 1}-1`
+                    };
                     
-                    // Attempt to auto-populate part number if missing
-                    if (!comp.supplierPartNumber) {
-                        const match = (db.suppliers || []).flatMap(s => s.priceList || []).find(p => String(p?.description || '').trim().toLowerCase() === String(comp.description || '').trim().toLowerCase());
-                        if (match) comp.supplierPartNumber = match.partNumber;
+                    // Automatic intelligence: search price list for match
+                    const match = (db.suppliers || []).flatMap(s => s.priceList || []).find(p => String(p?.description || '').trim().toLowerCase() === String(item.description || '').trim().toLowerCase());
+                    if (match) newComp.supplierPartNumber = match.partNumber;
+
+                    item.components = [newComp];
+                } else {
+                    // Mirror sync: Only the first component is active in TRADING
+                    const comp = item.components[0];
+                    if (comp.description !== item.description || comp.quantity !== getItemEffectiveQty(item)) {
+                        comp.description = item.description;
+                        comp.quantity = getItemEffectiveQty(item);
+                        
+                        // Attempt to auto-populate part number if missing
+                        if (!comp.supplierPartNumber) {
+                            const match = (db.suppliers || []).flatMap(s => s.priceList || []).find(p => String(p?.description || '').trim().toLowerCase() === String(comp.description || '').trim().toLowerCase());
+                            if (match) comp.supplierPartNumber = match.partNumber;
+                        }
+                    }
+                    // Cap at 1 component for TRADING to prevent BoM pollution
+                    if (item.components.length > 1) {
+                        item.components = [item.components[0]];
                     }
                 }
-                // Cap at 1 component for TRADING to prevent BoM pollution
-                if (item.components.length > 1) {
-                    item.components = [item.components[0]];
-                }
             }
-        }
 
-        if (item.productionType === 'OUTSOURCING') {
-            if (!item.components || item.components.length === 0) {
-                const contractNum = order.contractId || order.blanketContractId || `CON-${order.internalOrderNumber || 'ORD'}-${idx + 1}`;
-                const newComp = {
-                    id: `c_${Date.now()}_${idx}_0`,
-                    description: item.description,
-                    quantity: getItemEffectiveQty(item),
-                    unit: item.unit || 'pcs',
-                    unitCost: 0,
-                    taxPercent: item.taxPercent || 14,
-                    source: 'PROCUREMENT',
-                    status: 'PENDING_OFFER',
-                    componentNumber: item.supplierPartNumber || `CMP-${order.internalOrderNumber || 'ORD'}-${idx + 1}-1`,
-                    contractNumber: contractNum,
-                    contractStartDate: order.orderDate || undefined
-                };
-                item.components = [newComp];
+            if (item.productionType === 'OUTSOURCING') {
+                if (item.noRfpNeeded === undefined) item.noRfpNeeded = true;
+                if (!item.components || item.components.length === 0) {
+                    const contractNum = order.contractId || order.blanketContractId || `CON-${order.internalOrderNumber || 'ORD'}-${idx + 1}`;
+                    const newComp = {
+                        id: `c_${Date.now()}_${idx}_0`,
+                        description: item.description,
+                        quantity: getItemEffectiveQty(item),
+                        unit: item.unit || 'pcs',
+                        unitCost: 0,
+                        taxPercent: item.taxPercent || 14,
+                        source: 'PROCUREMENT',
+                        status: 'RUNNING_OUTSOURCING_CONTRACT',
+                        noRfpNeeded: true,
+                        componentNumber: item.supplierPartNumber || `CMP-${order.internalOrderNumber || 'ORD'}-${idx + 1}-1`,
+                        contractNumber: contractNum,
+                        contractStartDate: order.orderDate || undefined
+                    };
+                    item.components = [newComp];
+                } else {
+                    item.components.forEach(comp => {
+                        if (comp.noRfpNeeded === undefined) comp.noRfpNeeded = true;
+                        if (comp.noRfpNeeded && (comp.status === 'PENDING_OFFER' || !comp.status)) {
+                            comp.status = 'RUNNING_OUTSOURCING_CONTRACT';
+                        }
+                    });
+                }
             }
         }
 
@@ -1350,6 +1626,19 @@ const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipSta
                             order.logs.push(createAuditLog(`[AUTO] Trading items ready for delivery. Auto-transitioned to Ready for Invoicing`, order.status, 'System'));
                         }
                     }
+                } else if (statusDriver === 'outsourcing') {
+                    const anyNeedsRfp = outsourcingItems.some(item =>
+                        (item.components || []).some(comp => comp.noRfpNeeded === false && ['PENDING_OFFER', 'RFP_SENT', 'AWARDED'].includes(comp.status))
+                    );
+                    if (!anyNeedsRfp && order.status === OrderStatus.WAITING_SUPPLIERS) {
+                        const old = order.status;
+                        order.status = OrderStatus.RUNNING_OUTSOURCING_CONTRACT;
+                        order.logs.push(createAuditLog(`[AUTO] Outsourcing contract active. Status moved from ${old} to ${order.status}`, order.status, 'System'));
+                    } else if (anyNeedsRfp && order.status === OrderStatus.RUNNING_OUTSOURCING_CONTRACT) {
+                        const old = order.status;
+                        order.status = OrderStatus.WAITING_SUPPLIERS;
+                        order.logs.push(createAuditLog(`[AUTO] Outsourcing contract requires RFP. Status moved from ${old} to ${order.status}`, order.status, 'System'));
+                    }
                 }
             }
         }
@@ -1483,7 +1772,8 @@ const STATUS_TO_THRESHOLD = {
     'DELIVERY': 'deliveredLimitHrs',
     'PARTIAL_DELIVERY': 'deliveredLimitHrs',
     'DELIVERED': 'deliveredLimitHrs',
-    'PARTIAL_PAYMENT': null  // handled by special payment SLA check
+    'PARTIAL_PAYMENT': null,  // handled by special payment SLA check
+    'RUNNING_OUTSOURCING_CONTRACT': null
 };
 
 // Maps Component CompStatus Ã¢â€ â€™ settings config key (procurement process thresholds)
@@ -1491,7 +1781,8 @@ const COMP_STATUS_TO_THRESHOLD = {
     'PENDING_OFFER': 'pendingOfferLimitHrs',
     'RFP_SENT': 'rfpSentLimitHrs',
     'AWARDED': 'awardedLimitHrs',
-    'ORDERED': 'orderedLimitHrs'
+    'ORDERED': 'orderedLimitHrs',
+    'RUNNING_OUTSOURCING_CONTRACT': null
 };
 
 // Human-friendly labels for email subjects and logs
@@ -1792,9 +2083,28 @@ app.use(bodyParser.json({ limit: '50mb' }));
 // Resolves x-sandbox-owner into req.sandboxDbPath / req.sandboxOwner / req.roles.
 // Live mode (no header) is a zero-disk-IO pass-through; roles are evaluated
 // downstream by each handler that needs them.
+//
+// Role pattern (read before adding any new admin-gated handler):
+//   - Sandbox mode (x-sandbox-owner set): req.roles is populated from the
+//     sandbox user's live-synced roles; `req.roles.includes('admin')` works.
+//   - Live mode (no x-sandbox-owner): req.roles is `[]` BY DESIGN. Any new
+//     admin-gated endpoint added to server.js MUST use `isAdminUser(req)`
+//     (or its own live-DB lookup) — using `req.roles.includes('admin')`
+//     directly will silently deny every live caller. This is a hard rule;
+//     see `isAdminUser` for the implementation.
 app.use((req, res, next) => {
-    const username = req.headers['x-user'];
+    const apiKeyHeader = String(req.headers['x-api-key'] || '').trim();
+    let username = req.headers['x-user'];
     const sandboxOwner = req.headers['x-sandbox-owner'];
+
+    // API-key header authentication (ERP Test Tool / machine clients): when an
+    // x-api-key header is present it resolves to the key's owner user (identity
+    // match against the live DB). Sandbox tenancy still applies via x-sandbox-owner.
+    if (apiKeyHeader) {
+        const keyRec = findApiKeyBySecret(apiKeyHeader, { touch: false });
+        if (!keyRec) return res.status(401).json({ error: 'Invalid API key.' });
+        username = keyRec.username;
+    }
 
     req.user = username || null;
     req.roles = [];
@@ -2500,10 +2810,20 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
         switch (action) {
             case 'finalize-study':
                 if (order.items.some(it => !it.isAccepted)) throw new Error("All items must be accepted before finalizing study");
-                order.status = OrderStatus.WAITING_SUPPLIERS;
                 
-                // Ensure all items have their procurement components and transition to PENDING_OFFER
+                // Ensure all items have their procurement components and transition properly
                 order.items.forEach((item, idx) => {
+                    const isOutsourcing = item.productionType === 'OUTSOURCING';
+                    let metrics = { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+                    if (item.costSheetFile) {
+                        try {
+                            metrics = extractCostSheetMetrics(item.costSheetFile);
+                            item.workingResourceCount = metrics.resourceCount || item.workingResourceCount || 0;
+                            item.realCost = metrics.realCost || item.realCost || 0;
+                            item.invoiceTotal = metrics.invoiceTotal || item.invoiceTotal || 0;
+                        } catch (e) {}
+                    }
+
                     if (!item.components || item.components.length === 0) {
                         const contractNum = order.contractId || order.blanketContractId || `CON-${order.internalOrderNumber || 'ORD'}-${idx + 1}`;
                         item.components = [{
@@ -2511,42 +2831,105 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                             description: item.description,
                             quantity: getItemEffectiveQty(item),
                             unit: item.unit || 'pcs',
-                            unitCost: 0,
+                            unitCost: metrics.realCost > 0 ? metrics.realCost : (item.pricePerUnit || 0),
                             taxPercent: item.taxPercent || 14,
                             source: 'PROCUREMENT',
-                            status: 'PENDING_OFFER',
+                            status: isOutsourcing ? 'RUNNING_OUTSOURCING_CONTRACT' : 'PENDING_OFFER',
+                            noRfpNeeded: isOutsourcing ? true : false,
+                            workingResourceCount: item.workingResourceCount,
+                            realCost: item.realCost,
+                            invoiceTotal: item.invoiceTotal,
                             componentNumber: item.supplierPartNumber || `CMP-${order.internalOrderNumber || 'ORD'}-${idx + 1}-1`,
-                            contractNumber: item.productionType === 'OUTSOURCING' ? contractNum : undefined,
+                            contractNumber: isOutsourcing ? contractNum : undefined,
                             contractStartDate: order.orderDate || undefined,
                             procurementStartedAt: new Date().toISOString(),
                             statusUpdatedAt: new Date().toISOString()
                         }];
                     }
                     (item.components || []).forEach(comp => {
-                        if (comp.source === 'PROCUREMENT' && ['NEW', 'PENDING_OFFER'].includes(comp.status)) {
+                        if (isOutsourcing || comp.contractNumber) {
+                            if (comp.noRfpNeeded === undefined) comp.noRfpNeeded = true;
+                            if (comp.noRfpNeeded && ['NEW', 'PENDING_OFFER'].includes(comp.status)) {
+                                comp.status = 'RUNNING_OUTSOURCING_CONTRACT';
+                            }
+                            if (item.workingResourceCount) comp.workingResourceCount = item.workingResourceCount;
+                            if (item.realCost) {
+                                comp.realCost = item.realCost;
+                                if (comp.unitCost === 0) comp.unitCost = item.realCost;
+                            }
+                            if (item.invoiceTotal) comp.invoiceTotal = item.invoiceTotal;
+                        } else if (comp.source === 'PROCUREMENT' && ['NEW', 'PENDING_OFFER'].includes(comp.status)) {
                             comp.status = 'PENDING_OFFER';
                             if (!comp.procurementStartedAt) {
                                 comp.procurementStartedAt = new Date().toISOString();
                             }
-                            comp.statusUpdatedAt = new Date().toISOString();
                         }
+                        comp.statusUpdatedAt = new Date().toISOString();
                     });
                 });
+
+                // Check if the order is purely outsourcing with no RFP needed -> RUNNING_OUTSOURCING_CONTRACT
+                const allProcComps = order.items.flatMap(it => it.components || []).filter(c => c.source === 'PROCUREMENT');
+                const anyNeedsRfp = allProcComps.some(c => !c.noRfpNeeded && ['NEW', 'PENDING_OFFER', 'RFP_SENT', 'AWARDED'].includes(c.status));
+                const anyRunningOutsourcing = allProcComps.some(c => c.status === 'RUNNING_OUTSOURCING_CONTRACT' || (c.noRfpNeeded && (c.contractNumber || order.items.some(i => i.productionType === 'OUTSOURCING'))));
+
+                if (!anyNeedsRfp && anyRunningOutsourcing) {
+                    order.status = OrderStatus.RUNNING_OUTSOURCING_CONTRACT;
+                } else {
+                    order.status = OrderStatus.WAITING_SUPPLIERS;
+                }
 
                 order.logs.push(createAuditLog('Technical study finalized and pushed to Procurement', order.status, user));
                 break;
 
             case 'rollback-to-logged':
                 const rollbackOld = JSON.parse(JSON.stringify(order));
+                const nowIso = new Date().toISOString();
+                const todayDate = nowIso.split('T')[0];
+
                 order.status = OrderStatus.LOGGED;
-                // Clear components and reset item approvals, but PRESERVE ORDERED_FOR_STOCK components
-                // (these are in-transit to stock and will be received via Reception)
+                order.dataEntryTimestamp = nowIso;
+                order.orderDate = todayDate;
+                order.statusUpdatedAt = nowIso;
+                order.loggingComplianceViolation = false;
+                delete order.statusEnteredAt;
+                delete order.lastStatusChange;
+                delete order.statusBeforeHold;
+
+                // Clear all components added in technical review & reset item approvals
                 order.items.forEach(item => {
-                    item.components = (item.components || []).filter(c => c.status === 'ORDERED_FOR_STOCK');
+                    item.components = [];
                     item.isAccepted = false;
+                    delete item.technicalReviewStatus;
+                    delete item.bomConfigured;
+
+                    // Remove any database of cost sheet and delete the cost sheets
+                    delete item.costSheetFile;
+                    delete item.costSheetFileName;
+                    delete item.costSheetText;
+                    delete item.costSheets;
+                    delete item.costSheetEditableCells;
+                    delete item.costSheetCellColors;
+                    delete item.workingResourceCount;
+                    delete item.realCost;
+                    delete item.invoiceTotal;
+                    delete item.noRfpNeeded;
                 });
+
+                // Clear any order-level cost sheet properties
+                delete order.costSheetFile;
+                delete order.costSheetFileName;
+                delete order.costSheetText;
+                delete order.costSheets;
+                delete order.costSheetEditableCells;
+                delete order.costSheetCellColors;
+                delete order.workingResourceCount;
+                delete order.realCost;
+                delete order.invoiceTotal;
+                delete order.noRfpNeeded;
+
                 reconcileInventory(rollbackOld, order, db);
-                order.logs.push(createAuditLog(`Rollback to Registry: ${payload?.reason || 'Manual rollback'} (BoM cleared & stock released)`, order.status, user));
+                order.logs.push(createAuditLog(`Rollback to Logged: SLA reset from scratch, BoM components and cost sheets cleared. Reason: ${payload?.reason || 'Manual rollback'}`, order.status, user));
 
                 // Notification for Rollback
                 if (settings && settings.enableRollbackAlerts) {
@@ -2683,6 +3066,10 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 
                 sptItem.productionType = newType;
                 
+                if (order.status === OrderStatus.LOGGED) {
+                    order.status = OrderStatus.TECHNICAL_REVIEW;
+                }
+                
                 if (newType === 'TRADING') {
                     // Release any existing reservations before clearing for Trading
                     (sptItem.components || []).forEach(comp => {
@@ -2714,11 +3101,77 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 const ucsItemIdx = order.items.findIndex(i => i.id === payload.itemId);
                 if (ucsItemIdx === -1) throw new Error("Item not found");
                 const ucsItem = order.items[ucsItemIdx];
-                ucsItem.costSheetFile = payload.costSheetFile || undefined;
-                ucsItem.costSheetFileName = payload.costSheetFileName || undefined;
+                const replaceWrongData = Boolean(payload.replaceWrongData);
+
+                let metrics = { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+                if (payload.costSheetFile) {
+                    try {
+                        metrics = extractCostSheetMetrics(payload.costSheetFile);
+                    } catch (err) {
+                        console.error("[CostSheet] Failed to extract metrics:", err);
+                    }
+                }
+
+                const newRecord = payload.costSheetFile ? {
+                    id: `cs_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+                    fileName: payload.costSheetFileName || 'cost-sheet.xlsx',
+                    uploadedAt: new Date().toISOString(),
+                    fileData: payload.costSheetFile,
+                    workingResourceCount: metrics.resourceCount,
+                    realCost: metrics.realCost,
+                    invoiceTotal: metrics.invoiceTotal,
+                    monthLabel: new Date().toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+                } : null;
+
+                if (!ucsItem.costSheets) ucsItem.costSheets = [];
+
+                if (replaceWrongData) {
+                    // Erase current wrong uploaded data: overwrite active and replace records
+                    ucsItem.costSheets = newRecord ? [newRecord] : [];
+                    ucsItem.costSheetFile = payload.costSheetFile || undefined;
+                    ucsItem.costSheetFileName = payload.costSheetFileName || undefined;
+                } else {
+                    // Default: Keep previous sheets as historical record, append new sheet
+                    if (newRecord) {
+                        ucsItem.costSheets.push(newRecord);
+                    }
+                    ucsItem.costSheetFile = payload.costSheetFile || undefined;
+                    ucsItem.costSheetFileName = payload.costSheetFileName || undefined;
+                }
+
+                ucsItem.workingResourceCount = metrics.resourceCount || ucsItem.workingResourceCount || 0;
+                ucsItem.realCost = metrics.realCost || ucsItem.realCost || 0;
+                ucsItem.invoiceTotal = metrics.invoiceTotal || ucsItem.invoiceTotal || 0;
                 ucsItem.costSheetEditableCells = payload.costSheetEditableCells || undefined;
                 ucsItem.costSheetCellColors = payload.costSheetCellColors || undefined;
-                order.logs.push(createAuditLog(`Item ${ucsItem.orderNumber || ucsItemIdx + 1}: ${payload.costSheetFile ? `Cost sheet uploaded (${payload.costSheetFileName})` : 'Cost sheet removed'}`, order.status, user));
+
+                // Sync to components of this item
+                (ucsItem.components || []).forEach(comp => {
+                    comp.workingResourceCount = ucsItem.workingResourceCount;
+                    comp.realCost = ucsItem.realCost;
+                    comp.invoiceTotal = ucsItem.invoiceTotal;
+                    if (metrics.realCost > 0) comp.unitCost = metrics.realCost;
+                    if (comp.noRfpNeeded === undefined || comp.noRfpNeeded) {
+                        comp.noRfpNeeded = true;
+                        comp.status = 'RUNNING_OUTSOURCING_CONTRACT';
+                        comp.statusUpdatedAt = new Date().toISOString();
+                    }
+                });
+
+                // Check order status: if pure outsourcing or all components are in running outsourcing contract / done
+                const allProcComps = order.items.flatMap(it => it.components || []).filter(c => c.source === 'PROCUREMENT');
+                const anyNeedsRfp = allProcComps.some(c => !c.noRfpNeeded && ['NEW', 'PENDING_OFFER', 'RFP_SENT', 'AWARDED'].includes(c.status));
+                const anyRunningOutsourcing = allProcComps.some(c => c.status === 'RUNNING_OUTSOURCING_CONTRACT' || (c.noRfpNeeded && (c.contractNumber || order.items.some(i => i.productionType === 'OUTSOURCING'))));
+
+                if (!anyNeedsRfp && anyRunningOutsourcing) {
+                    order.status = OrderStatus.RUNNING_OUTSOURCING_CONTRACT;
+                }
+
+                order.logs.push(createAuditLog(
+                    `Item ${ucsItem.orderNumber || ucsItemIdx + 1}: ${payload.costSheetFile ? `Cost sheet updated (${payload.costSheetFileName}, ${metrics.resourceCount} resources, Cost: ${metrics.realCost} L.E.)${replaceWrongData ? ' [Replaced previous data]' : ' [Appended monthly record]'}` : 'Cost sheet removed'}`, 
+                    order.status, 
+                    user
+                ));
                 break;
             }
 
@@ -2959,6 +3412,12 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 if (!ccComp) throw new Error("Component not found");
                 const oldPoNumber = ccComp.poNumber || 'N/A';
                 const oldSupplier = ccComp.supplierName || ccComp.supplierId || 'N/A';
+                const cancelReason = (payload.reason || '').trim() || 'PO cancelled by user';
+                ccComp.cancelledPoNumber = oldPoNumber;
+                ccComp.cancellationReason = cancelReason;
+                ccComp.lastAction = 'CANCELLED';
+                ccComp.lastActionComment = cancelReason;
+                delete ccComp.revertReason;
                 // Reset to PENDING_OFFER so it re-enters the procurement pipeline
                 ccComp.status = 'PENDING_OFFER';
                 ccComp.statusUpdatedAt = new Date().toISOString();
@@ -2971,8 +3430,10 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 delete ccComp.sendPoId;
                 delete ccComp.rfpId;
                 delete ccComp.rfpSupplierIds;
+                delete ccComp.quotedCurrency;
+                delete ccComp.cost;
                 ccComp.unitCost = 0;
-                order.logs.push(createAuditLog(`Supplier PO cancelled for: ${ccComp.description} (PO: ${oldPoNumber}, Supplier: ${oldSupplier}). Component reset to PENDING_OFFER for re-procurement.`, order.status, user));
+                order.logs.push(createAuditLog(`Supplier PO cancelled for: ${ccComp.description} (PO: ${oldPoNumber}, Supplier: ${oldSupplier}). Reason: ${cancelReason}. Component reset to PENDING_OFFER for re-procurement.`, 'CANCELLED', user));
                 // If order was past WAITING_SUPPLIERS, revert it since a component now needs procurement
                 if ([OrderStatus.WAITING_FACTORY, OrderStatus.MANUFACTURING].includes(order.status)) {
                     const old = order.status;
@@ -2993,6 +3454,7 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                     item.components?.forEach(comp => {
                         if (payload.components.includes(comp.id)) {
                             comp.status = 'RFP_SENT';
+                            comp.noRfpNeeded = false;
                             comp.rfpId = rfpId;
                             comp.rfpSupplierIds = rfpSupplierIds;
                             comp.statusUpdatedAt = new Date().toISOString();
@@ -3089,19 +3551,43 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
             case 'cancel-po-batch': {
                 if (!payload.sendPoId) throw new Error("sendPoId required");
                 let updatedCount = 0;
+                const cancelReason = (payload.reason || '').trim() || 'PO cancelled by user';
+                let cancelledPoNum = '';
                 order.items.forEach(item => {
                     item.components?.forEach(comp => {
                         if (comp.sendPoId === payload.sendPoId && (comp.status === 'ORDERED' || comp.status === 'WAITING_CONTRACT_START')) {
-                            comp.status = 'AWARDED';
+                            cancelledPoNum = comp.poNumber || cancelledPoNum;
+                            comp.cancelledPoNumber = comp.poNumber || '';
+                            comp.cancellationReason = cancelReason;
+                            comp.lastAction = 'CANCELLED';
+                            comp.lastActionComment = cancelReason;
+                            delete comp.revertReason;
                             delete comp.sendPoId;
                             delete comp.poNumber;
-                            // Keep contractStartDate and contractNumber intact for re-issuance
+                            delete comp.contractStartDate;
+                            delete comp.contractNumber;
+                            delete comp.awardId;
+                            delete comp.rfpId;
+                            delete comp.rfpSupplierIds;
+                            delete comp.supplierId;
+                            delete comp.supplierName;
+                            delete comp.quotedCurrency;
+                            delete comp.cost;
+                            comp.unitCost = 0;
+                            comp.status = 'PENDING_OFFER';
                             comp.statusUpdatedAt = new Date().toISOString();
+                            comp.procurementStartedAt = new Date().toISOString();
                             updatedCount++;
                         }
                     });
                 });
-                order.logs.push(createAuditLog(`Cancelled PO batch for ${updatedCount} components (Former Group ID: ${payload.sendPoId})`, order.status, user));
+                order.logs.push(createAuditLog(`Cancelled PO batch ${cancelledPoNum ? `(PO: ${cancelledPoNum}) ` : ''}for ${updatedCount} components (Group ID: ${payload.sendPoId}). Reason: ${cancelReason}. Returned to Send RFP (PENDING_OFFER).`, 'CANCELLED', user));
+                // If order was past WAITING_SUPPLIERS, revert it since components now require re-procurement
+                if ([OrderStatus.WAITING_FACTORY, OrderStatus.MANUFACTURING, OrderStatus.READY_FOR_PRODUCTION].includes(order.status)) {
+                    const oldOrdStatus = order.status;
+                    order.status = OrderStatus.WAITING_SUPPLIERS;
+                    order.logs.push(createAuditLog(`[AUTO] Order reverted from ${oldOrdStatus} to WAITING_SUPPLIERS: components require re-procurement after PO cancellation.`, order.status, 'System'));
+                }
                 break;
             }
 
@@ -3116,13 +3602,19 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 }
                 const oldStatus = comp.status;
                 const oldPoNumber = comp.poNumber || 'N/A';
+                const revertReason = (payload.reason || '').trim() || 'Reverted to award by user';
                 comp.status = 'AWARDED';
                 comp.statusUpdatedAt = new Date().toISOString();
+                comp.revertedPoNumber = oldPoNumber;
+                comp.revertReason = revertReason;
+                comp.lastAction = 'REVERTED_TO_AWARD';
+                comp.lastActionComment = revertReason;
+                delete comp.cancellationReason;
                 delete comp.sendPoId;
                 delete comp.poNumber;
                 delete comp.contractStartDate;
                 delete comp.contractNumber;
-                order.logs.push(createAuditLog(`Reverted PO for component ${comp.description} (PO: ${oldPoNumber}) from ${oldStatus} back to AWARDED. Re-award or re-issue PO.`, order.status, user));
+                order.logs.push(createAuditLog(`Reverted PO for component ${comp.description} (PO: ${oldPoNumber}) from ${oldStatus} back to AWARDED. Reason: ${revertReason}.`, 'REVERTED_TO_AWARD', user));
                 break;
             }
 
@@ -4348,10 +4840,21 @@ app.post('/api/v1/admin/switch-sandbox', (req, res) => {
 });
 
 app.post('/api/v1/login', (req, res) => {
-  const { password, environment } = req.body;
-  const username = String(req.body.username || '').trim();
+  const { password, environment, apiKey } = req.body;
+  let username = String(req.body.username || '').trim();
   const targetEnv = environment || 'live';
   const liveDb = readDb(DB_PATH);
+
+  // --- API KEY authentication (ERP Test Tool, alternative to username + password) ---
+  // An admin-generated API key resolves to its owner user, then the normal
+  // environment resolution below proceeds identically to a password login.
+  let authedViaApiKey = false;
+  if (apiKey && !password) {
+    const keyRec = findApiKeyBySecret(String(apiKey).trim(), { touch: true });
+    if (!keyRec) return res.status(401).json({ error: "Invalid API key." });
+    username = keyRec.username;
+    authedViaApiKey = true;
+  }
 
   const isFactory = username === 'factory' && (Date.now() - SERVER_START_TIME) < 300000 && password === FACTORY_PASS;
   if (isFactory) {
@@ -4363,14 +4866,14 @@ app.post('/api/v1/login', (req, res) => {
 
   if (targetEnv === 'live') {
     const user = (liveDb.users || []).find(u => u.username.toLowerCase() === (username || '').toLowerCase());
-    if (!user || user.password !== hashPassword(password)) return res.status(401).json({ error: "Invalid username or password" });
+    if (!user || (!authedViaApiKey && user.password !== hashPassword(password))) return res.status(401).json({ error: "Invalid username or password" });
     const { password: _, ...safe } = user;
-    return res.json(safe);
+    return res.json({ ...safe, authMethod: authedViaApiKey ? 'api-key' : 'password' });
   }
 
   if (targetEnv === 'self' || targetEnv.toLowerCase() === (username || '').toLowerCase()) {
     const liveUser = (liveDb.users || []).find(u => u.username.toLowerCase() === (username || '').toLowerCase());
-    if (!liveUser || liveUser.password !== hashPassword(password)) return res.status(401).json({ error: "Invalid username or password" });
+    if (!liveUser || (!authedViaApiKey && liveUser.password !== hashPassword(password))) return res.status(401).json({ error: "Invalid username or password" });
 
     const sandboxPath = getSandboxDbPath(username);
     if (!fs.existsSync(sandboxPath)) {
@@ -4426,7 +4929,13 @@ app.post('/api/v1/login', (req, res) => {
   const hasAccess = sandboxUser && (sandboxUser.sandboxAccess || isTargetAdmin || sandboxUser.username.toLowerCase() === ownerSanitized);
   
   if (!hasAccess) return res.status(403).json({ error: "You do not have access to this team sandbox." });
-  if (sandboxUser.password !== hashPassword(password) && liveTargetUser?.password !== hashPassword(password)) {
+  // Design intent: when an API key authenticated the caller, the sandbox password
+  // check is intentionally skipped. The key has already proven the caller's
+  // identity at the live-DB level (see findApiKeyBySecret + the `authedViaApiKey`
+  // branch above); the sandbox itself trusts the live identity it auto-syncs
+  // from. Admin / shared-sandbox access control is still enforced via `hasAccess`
+  // above — this only removes the redundant per-sandbox password re-prompt.
+  if (!authedViaApiKey && sandboxUser.password !== hashPassword(password) && liveTargetUser?.password !== hashPassword(password)) {
     return res.status(401).json({ error: "Invalid username or password for this sandbox." });
   }
 
@@ -4448,8 +4957,90 @@ app.post('/api/v1/login', (req, res) => {
     groupIds: liveTargetUser?.groupIds || sandboxUser.groupIds || [],
     sandbox: true,
     sandboxOwner: ownerSanitized,
-    sandboxLabel: `${ownerUser?.name || ownerSanitized}'s Team Sandbox`
+    sandboxLabel: `${ownerUser?.name || ownerSanitized}'s Team Sandbox`,
+    authMethod: authedViaApiKey ? 'api-key' : 'password'
   });
+});
+
+
+// --- API KEYS (ERP Test Tool machine authentication) ---
+// Admin-only endpoints for generating / listing / toggling / revoking API keys.
+// Keys live in the LIVE database `apiKeys` collection; the full secret is only
+// returned once, at creation time.
+app.get('/api/v1/api-keys', (req, res) => {
+    if (!isAdminUser(req)) return res.status(403).json({ error: 'Admin privileges are required to manage API keys.' });
+    const liveDb = readDb(DB_PATH);
+    const safe = (liveDb.apiKeys || []).map(({ keyHash, ...rest }) => rest);
+    return res.json(safe);
+});
+
+app.post('/api/v1/api-keys', (req, res) => {
+    if (!isAdminUser(req)) return res.status(403).json({ error: 'Admin privileges are required to manage API keys.' });
+    const liveDb = readDb(DB_PATH);
+    const name = String(req.body.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'Key name is required.' });
+
+    const creator = String(req.headers['x-user'] || req.user || 'admin').trim();
+    let ownerUsername = String(req.body.username || '').trim();
+    if (!ownerUsername) ownerUsername = creator;
+
+    const ownerUser = (liveDb.users || []).find(u => u.username.toLowerCase() === ownerUsername.toLowerCase());
+    if (!ownerUser) return res.status(400).json({ error: `User "${ownerUsername}" does not exist.` });
+
+    const secret = generateApiKey();
+    const record = {
+        id: makeApiKeyId(),
+        name,
+        username: ownerUser.username,
+        keyHash: hashApiKey(secret),
+        prefix: secret.slice(0, 14),
+        createdAt: new Date().toISOString(),
+        createdBy: creator,
+        lastUsedAt: null,
+        enabled: true
+    };
+    liveDb.apiKeys = liveDb.apiKeys || [];
+    liveDb.apiKeys.push(record);
+    if (!writeDb(liveDb, DB_PATH)) return res.status(500).json({ error: 'Failed to store API key.' });
+    invalidateApiKeyCache();   // ensure the new key is usable on the next request
+
+    console.log(`[API Keys] Created key "${name}" for ${record.username} by ${creator}.`);
+    const { keyHash, ...safeRecord } = record;
+    return res.status(201).json({ ...safeRecord, key: secret });
+});
+
+app.put('/api/v1/api-keys/:id', (req, res) => {
+    if (!isAdminUser(req)) return res.status(403).json({ error: 'Admin privileges are required to manage API keys.' });
+    const liveDb = readDb(DB_PATH);
+    const list = liveDb.apiKeys || [];
+    const idx = list.findIndex(k => k.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'API key not found.' });
+
+    const updates = {};
+    if (typeof req.body.name === 'string' && req.body.name.trim()) updates.name = req.body.name.trim();
+    if (typeof req.body.enabled === 'boolean') updates.enabled = req.body.enabled;
+    list[idx] = { ...list[idx], ...updates };
+    liveDb.apiKeys = list;
+    if (!writeDb(liveDb, DB_PATH)) return res.status(500).json({ error: 'Failed to update API key.' });
+    invalidateApiKeyCache();   // disable / re-enable takes effect on the next request
+
+    const { keyHash, ...safeRecord } = list[idx];
+    return res.json(safeRecord);
+});
+
+app.delete('/api/v1/api-keys/:id', (req, res) => {
+    if (!isAdminUser(req)) return res.status(403).json({ error: 'Admin privileges are required to manage API keys.' });
+    const liveDb = readDb(DB_PATH);
+    const list = liveDb.apiKeys || [];
+    const idx = list.findIndex(k => k.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'API key not found.' });
+
+    list.splice(idx, 1);
+    liveDb.apiKeys = list;
+    if (!writeDb(liveDb, DB_PATH)) return res.status(500).json({ error: 'Failed to delete API key.' });
+    invalidateApiKeyCache();   // revoked key stops authenticating immediately
+
+    return res.json({ success: true, message: 'API key revoked.' });
 });
 
 
