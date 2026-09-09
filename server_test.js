@@ -1105,6 +1105,12 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
             case 'rollback-to-logged':
                 const rollbackOld = JSON.parse(JSON.stringify(order));
                 order.status = OrderStatus.LOGGED;
+                // Set or preserve blanketOrder classification
+                if (payload && payload.isBlanket !== undefined) {
+                    order.blanketOrder = Boolean(payload.isBlanket);
+                } else if (order.blanketOrder === undefined) {
+                    order.blanketOrder = Boolean(order.contractId || order.blanketContractId || (order.items && order.items.some(i => i.productionType === 'OUTSOURCING')));
+                }
                 // Clear components and reset item approvals as requested
                 order.items.forEach(item => {
                     item.components = [];

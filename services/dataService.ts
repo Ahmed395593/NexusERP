@@ -459,8 +459,8 @@ class DataService {
     return this.dispatchAction(orderId, 'finalize-study');
   }
 
-  async rollbackOrderToLogged(orderId: string, reason: string) {
-    return this.dispatchAction(orderId, 'rollback-to-logged', { reason });
+  async rollbackOrderToLogged(orderId: string, reason: string, isBlanket?: boolean) {
+    return this.dispatchAction(orderId, 'rollback-to-logged', { reason, isBlanket });
   }
 
   async getUniquePoNumber() { return `PO-${Date.now().toString().slice(-6)}`; }

@@ -2896,6 +2896,13 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 delete order.lastStatusChange;
                 delete order.statusBeforeHold;
 
+                // Set or preserve blanketOrder classification
+                if (payload && payload.isBlanket !== undefined) {
+                    order.blanketOrder = Boolean(payload.isBlanket);
+                } else if (order.blanketOrder === undefined) {
+                    order.blanketOrder = Boolean(order.contractId || order.blanketContractId || (order.items && order.items.some(i => i.productionType === 'OUTSOURCING')));
+                }
+
                 // Clear all components added in technical review & reset item approvals
                 order.items.forEach(item => {
                     item.components = [];
@@ -2929,7 +2936,8 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 delete order.noRfpNeeded;
 
                 reconcileInventory(rollbackOld, order, db);
-                order.logs.push(createAuditLog(`Rollback to Logged: SLA reset from scratch, BoM components and cost sheets cleared. Reason: ${payload?.reason || 'Manual rollback'}`, order.status, user));
+                const orderTypeDesc = order.blanketOrder ? 'Blanket Order' : 'Standard Order';
+                order.logs.push(createAuditLog(`Rollback to Logged (${orderTypeDesc}): SLA reset from scratch, BoM components and cost sheets cleared. Reason: ${payload?.reason || 'Manual rollback'}`, order.status, user));
 
                 // Notification for Rollback
                 if (settings && settings.enableRollbackAlerts) {

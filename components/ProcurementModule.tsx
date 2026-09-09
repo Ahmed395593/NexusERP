@@ -913,8 +913,18 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const [pendingResolutions, setPendingResolutions] = useState<InTransitCompRecord[] | null>(null);
   const [resolutionChoices, setResolutionChoices] = useState<Record<string, CompResolution>>({});
   const [pendingRollbackOrder, setPendingRollbackOrder] = useState<CustomerOrder | null>(null);
+  const [rollbackIsBlanket, setRollbackIsBlanket] = useState<boolean>(false);
   const [allOrders, setAllOrders] = useState<CustomerOrder[]>([]);
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' }>({ key: 'orderDate', direction: 'asc' });
+
+  const isOrderBlanketType = (order: CustomerOrder): boolean => {
+    return Boolean(
+      order.blanketOrder ||
+      order.contractId ||
+      order.blanketContractId ||
+      (order.items && order.items.some(i => i.productionType === 'OUTSOURCING'))
+    );
+  };
 
 
   useEffect(() => { fetchData(); }, [refreshKey]);
@@ -1432,7 +1442,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
           setPendingRollbackOrder(null);
         }
 
-        await dataService.rollbackOrderToLogged(order.id, resetReason);
+        await dataService.rollbackOrderToLogged(order.id, resetReason, rollbackIsBlanket);
         setNoRfpOverrides(prev => {
           const next = { ...prev };
           delete next[order.id];
@@ -1613,6 +1623,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
     setReviveDuration('');
     setReviveEndDate('');
     setReviveMode('EXTENSION');
+    setRollbackIsBlanket(false);
   };
 
   const handleReplacementSubmit = async () => {
@@ -1897,6 +1908,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
       setPendingRollbackOrder(order);
     } else {
       // No in-transit components, go straight to rollback reason
+      setRollbackIsBlanket(isOrderBlanketType(order) || activeTab === 'outsourcing');
       setActiveAction({ type: 'ORDER_ROLLBACK', order });
     }
   };
@@ -1905,6 +1917,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const handleConfirmResolutions = () => {
     if (!pendingRollbackOrder) return;
     // Move to the rollback reason dialog with order context
+    setRollbackIsBlanket(isOrderBlanketType(pendingRollbackOrder) || activeTab === 'outsourcing');
     setActiveAction({ type: 'ORDER_ROLLBACK', order: pendingRollbackOrder });
   };
 
@@ -2546,7 +2559,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                 PO: <span className="text-slate-900 font-black">{o.customerReferenceNumber}</span>
                               </span>
                             )}
-                            {o.blanketOrder ? (
+                            {isOrderBlanketType(o) ? (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-teal-50 text-teal-700 border border-teal-200 text-[9px] font-black uppercase tracking-tight shadow-xs whitespace-nowrap shrink-0" title="Blanket Contract Order">
                                 <i className="fa-solid fa-layer-group text-[8px]"></i> Blanket
                               </span>
@@ -3953,13 +3966,10 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                       </div>
                     )}
 
-                    {(activeAction.type === 'RESET' || activeAction.type === 'ORDER_ROLLBACK') && (
+                    {activeAction.type === 'RESET' && (
                       <div className="p-6 bg-rose-50 rounded-3xl border border-rose-100 space-y-4">
                         <p className="text-sm text-rose-800 font-bold leading-relaxed">
-                          {activeAction.type === 'RESET'
-                            ? 'Warning: This will void current sourcing progress and return the component to "Pending Offer".'
-                            : 'Strategic Action: Reverting this entire order will move it back to the "Logged Registry". This should only be used to correct major entry errors.'
-                          }
+                          {t('procurement.reset.warningReset')}
                         </p>
                         <div className="space-y-1.5">
                           <label className="text-[9px] font-black text-rose-400 uppercase">{t('procurement.reset.mandatoryReason')}</label>
@@ -3968,6 +3978,76 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                             placeholder="e.g. Supplier failed to deliver, pricing expired, correction required..."
                             value={resetReason} onChange={e => setResetReason(e.target.value)}
                           />
+                        </div>
+                      </div>
+                    )}
+
+                    {activeAction.type === 'ORDER_ROLLBACK' && (
+                      <div className="space-y-4">
+                        <div className="p-5 bg-slate-50 rounded-3xl border border-slate-200 space-y-3">
+                          <div className="flex items-center justify-between">
+                            <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                              {t('procurement.rollback.targetClassification') || 'Target Order Classification in Logged Registry'}
+                            </label>
+                            <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-md border ${rollbackIsBlanket ? 'bg-teal-50 text-teal-700 border-teal-200' : 'bg-blue-50 text-blue-700 border-blue-200'}`}>
+                              {rollbackIsBlanket ? t('procurement.rollback.blanketOrder') : t('procurement.rollback.standardOrder')}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <button
+                              type="button"
+                              onClick={() => setRollbackIsBlanket(false)}
+                              className={`p-3.5 rounded-2xl border-2 text-left transition-all flex flex-col gap-1 cursor-pointer ${
+                                !rollbackIsBlanket
+                                  ? 'bg-blue-50/80 border-blue-500 text-blue-900 shadow-sm ring-2 ring-blue-500/20'
+                                  : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-black uppercase tracking-wider flex items-center gap-1.5">
+                                  <i className="fa-solid fa-box text-blue-600"></i> {t('procurement.rollback.standardOrder')}
+                                </span>
+                                {!rollbackIsBlanket && <i className="fa-solid fa-circle-check text-blue-600 text-xs"></i>}
+                              </div>
+                              <span className="text-[9px] font-medium text-slate-500">
+                                {t('procurement.rollback.standardOrderDesc')}
+                              </span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => setRollbackIsBlanket(true)}
+                              className={`p-3.5 rounded-2xl border-2 text-left transition-all flex flex-col gap-1 cursor-pointer ${
+                                rollbackIsBlanket
+                                  ? 'bg-teal-50/80 border-teal-500 text-teal-900 shadow-sm ring-2 ring-teal-500/20'
+                                  : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-black uppercase tracking-wider flex items-center gap-1.5">
+                                  <i className="fa-solid fa-layer-group text-teal-600"></i> {t('procurement.rollback.blanketOrder')}
+                                </span>
+                                {rollbackIsBlanket && <i className="fa-solid fa-circle-check text-teal-600 text-xs"></i>}
+                              </div>
+                              <span className="text-[9px] font-medium text-slate-500">
+                                {t('procurement.rollback.blanketOrderDesc')}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="p-6 bg-rose-50 rounded-3xl border border-rose-100 space-y-4">
+                          <p className="text-xs text-rose-800 font-bold leading-relaxed">
+                            {t('procurement.rollback.warningRollback')}
+                          </p>
+                          <div className="space-y-1.5">
+                            <label className="text-[9px] font-black text-rose-400 uppercase">{t('procurement.reset.mandatoryReason')}</label>
+                            <textarea
+                              className="w-full p-4 bg-white border border-rose-200 rounded-2xl text-sm font-bold outline-none focus:ring-4 focus:ring-rose-100"
+                              placeholder="e.g. Order specifications changed, pricing expired, correction required..."
+                              value={resetReason} onChange={e => setResetReason(e.target.value)}
+                            />
+                          </div>
                         </div>
                       </div>
                     )}

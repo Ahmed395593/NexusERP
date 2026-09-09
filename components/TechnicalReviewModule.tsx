@@ -347,20 +347,24 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
     });
   }, [searchQuery, orders]);
 
+  const isOrderBlanket = (o: CustomerOrder) => {
+    return Boolean(o.blanketOrder || o.contractId || o.blanketContractId);
+  };
+
   const blanketOrdersCount = useMemo(() => {
-    return allReviewableOrders.filter(o => o.blanketOrder === true).length;
+    return allReviewableOrders.filter(o => isOrderBlanket(o)).length;
   }, [allReviewableOrders]);
 
   const nonBlanketOrdersCount = useMemo(() => {
-    return allReviewableOrders.filter(o => !o.blanketOrder).length;
+    return allReviewableOrders.filter(o => !isOrderBlanket(o)).length;
   }, [allReviewableOrders]);
 
   const queueOrders = useMemo(() => {
     let filtered = allReviewableOrders.filter(o => {
       if (manufactureSubTab === 'blanket') {
-        return o.blanketOrder === true;
+        return isOrderBlanket(o);
       } else {
-        return !o.blanketOrder;
+        return !isOrderBlanket(o);
       }
     });
 
