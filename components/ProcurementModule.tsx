@@ -538,10 +538,13 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   // Frozen header measurement for the cost-sheet grid (rows 2-4 + column A stay fixed).
   const costSheetTheadRef = useRef<HTMLTableSectionElement>(null);
   const costSheetStubRef = useRef<HTMLTableCellElement>(null);
-  const costSheetRowRef = useRef<HTMLTableRowElement>(null);
   const [costSheetFrozenTop, setCostSheetFrozenTop] = useState(0);
   const [costSheetFrozenLeft, setCostSheetFrozenLeft] = useState(0);
-  const [costSheetRowHeight, setCostSheetRowHeight] = useState(0);
+  // Frozen rows/cells are collapsed to a compact height so they only show their text.
+  // Value is the full rendered row box (input + 2px top/bottom cell borders) so the
+  // stacked sticky offsets for frozen rows 2-4 line up exactly.
+  const COST_SHEET_FROZEN_ROW_HEIGHT = 34;
+  const COST_SHEET_FROZEN_INPUT_HEIGHT = COST_SHEET_FROZEN_ROW_HEIGHT - 4;
   const [noRfpOverrides, setNoRfpOverrides] = useState<Record<string, boolean>>({});
   const [eraseWrongDataByOrder, setEraseWrongDataByOrder] = useState<Record<string, boolean>>({});
 
@@ -632,7 +635,6 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
     requestAnimationFrame(() => {
       if (costSheetTheadRef.current) setCostSheetFrozenTop(costSheetTheadRef.current.offsetHeight);
       if (costSheetStubRef.current) setCostSheetFrozenLeft(costSheetStubRef.current.offsetWidth);
-      if (costSheetRowRef.current) setCostSheetRowHeight(costSheetRowRef.current.offsetHeight);
     });
   }, [costSheetWorkbook, costSheetSheetName]);
 
@@ -4063,13 +4065,13 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                               {costSheetCells.map((row, rowIndex) => {
                                 const frozenRowNumber = rowIndex + 1 + costSheetRowOffset;
                                 const isFrozenRow = [2, 3, 4].includes(frozenRowNumber);
-                                const frozenStickyTop = isFrozenRow ? costSheetFrozenTop + (frozenRowNumber - 2) * costSheetRowHeight : 0;
+                                const frozenStickyTop = isFrozenRow ? costSheetFrozenTop + (frozenRowNumber - 2) * COST_SHEET_FROZEN_ROW_HEIGHT : 0;
                                 return (
-                                <tr key={rowIndex} ref={rowIndex === 0 ? costSheetRowRef : undefined}>
+                                <tr key={rowIndex}>
                                   <td
-                                    className="sticky left-0 z-10 bg-slate-100 border-r-2 border-black text-right px-3 py-2 text-[11px] font-black text-slate-500"
+                                    className={`sticky left-0 z-10 bg-slate-100 border-r-2 border-black text-right px-3 text-[11px] font-black text-slate-500 ${isFrozenRow ? 'py-0' : 'py-2'}`}
                                     style={isFrozenRow
-                                      ? { position: 'sticky', top: frozenStickyTop, zIndex: 30 }
+                                      ? { position: 'sticky', top: frozenStickyTop, zIndex: 30, height: COST_SHEET_FROZEN_ROW_HEIGHT, lineHeight: `${COST_SHEET_FROZEN_INPUT_HEIGHT}px`, verticalAlign: 'middle' }
                                       : undefined}
                                   >
                                     {rowIndex + 1 + costSheetRowOffset}
@@ -4092,8 +4094,12 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                       cellStickyStyle.position = 'sticky';
                                       cellStickyStyle.backgroundColor = cellBg || '#ffffff';
                                       cellStickyStyle.zIndex = isFrozenRow && frozenCol ? 30 : 20;
-                                      if (isFrozenRow) cellStickyStyle.top = costSheetFrozenTop + (frozenRowNumber - 2) * costSheetRowHeight;
+                                      if (isFrozenRow) cellStickyStyle.top = costSheetFrozenTop + (frozenRowNumber - 2) * COST_SHEET_FROZEN_ROW_HEIGHT;
                                       if (frozenCol) cellStickyStyle.left = costSheetFrozenLeft;
+                                    }
+                                    if (isFrozenRow) {
+                                      cellStickyStyle.height = COST_SHEET_FROZEN_ROW_HEIGHT;
+                                      cellStickyStyle.verticalAlign = 'middle';
                                     }
                                     return (
                                       <td
@@ -4105,11 +4111,20 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                           readOnly={!isEditableEffective}
                                           value={displayValue === undefined || displayValue === null ? '' : String(displayValue)}
                                           onChange={e => { if (isEditableEffective) updateCostSheetCell(rowIndex, colIndex, e.target.value); }}
-                                          className={`w-full min-w-[120px] h-12 px-3 text-sm outline-none focus:ring-2 focus:border-sky-500 border-none ${isEditableEffective ? '' : 'cursor-not-allowed'}`}
+                                          className={`w-full min-w-[120px] ${isFrozenRow ? '' : 'h-12'} px-3 text-sm outline-none focus:ring-2 focus:border-sky-500 border-none ${isEditableEffective ? '' : 'cursor-not-allowed'}`}
                                           style={{
                                             backgroundColor: cellBg || 'transparent',
                                             color: cell.fontColor || '#1e293b',
                                             fontWeight: cell.fontBold ? 700 : undefined,
+                                            ...(isFrozenRow ? {
+                                              display: 'block',
+                                              height: COST_SHEET_FROZEN_INPUT_HEIGHT,
+                                              minHeight: COST_SHEET_FROZEN_INPUT_HEIGHT,
+                                              lineHeight: `${COST_SHEET_FROZEN_INPUT_HEIGHT}px`,
+                                              paddingTop: 0,
+                                              paddingBottom: 0,
+                                              boxSizing: 'border-box',
+                                            } : {}),
                                           }}
                                         />
                                       </td>
