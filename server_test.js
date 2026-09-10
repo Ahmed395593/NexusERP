@@ -800,6 +800,32 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'dist')));
 
+const getTechReviewStartTime = (order) => {
+    if (!order) return Date.now();
+    if (order.technicalReviewStartedAt) {
+        const t = new Date(order.technicalReviewStartedAt).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    const logs = order.logs || [];
+    for (let i = logs.length - 1; i >= 0; i--) {
+        const l = logs[i];
+        const msg = (l.message || '').toLowerCase();
+        if (l.status === 'LOGGED' || msg.includes('rollback to logged') || msg.includes('order acquisition')) {
+            const t = new Date(l.timestamp).getTime();
+            if (!isNaN(t) && t > 0) return t;
+        }
+    }
+    if (order.dataEntryTimestamp) {
+        const t = new Date(order.dataEntryTimestamp).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    if (order.orderDate) {
+        const t = new Date(order.orderDate).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    return Date.now();
+};
+
 // --- HEALTH CHECK HELPER ---
 const calculateOrderHealth = (order, settings) => {
     let isOverdue = false;
@@ -809,20 +835,23 @@ const calculateOrderHealth = (order, settings) => {
     if (limitKey) {
         const limitHrs = settings[limitKey];
         if (limitHrs > 0) {
-            const logs = order.logs || [];
-            let earliestLog = null;
-            // Iterate backwards to find the start of the current status block
-            for (let i = logs.length - 1; i >= 0; i--) {
-                if (logs[i].status === order.status) {
-                    earliestLog = logs[i];
-                } else {
-                    break;
+            let statusEnteredAt;
+            if (order.status === OrderStatus.TECHNICAL_REVIEW) {
+                statusEnteredAt = getTechReviewStartTime(order);
+            } else {
+                const logs = order.logs || [];
+                let earliestLog = null;
+                // Iterate backwards to find the start of the current status block
+                for (let i = logs.length - 1; i >= 0; i--) {
+                    if (logs[i].status === order.status) {
+                        earliestLog = logs[i];
+                    } else {
+                        break;
+                    }
                 }
+                statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             }
-            const statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             const elapsedHrs = (Date.now() - statusEnteredAt) / (1000 * 60 * 60);
-
-
 
             if (elapsedHrs > limitHrs) isOverdue = true;
         }

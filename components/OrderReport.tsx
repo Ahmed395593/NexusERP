@@ -1,8 +1,7 @@
-
 import React, { useState, useMemo, useEffect } from 'react';
 import { dataService } from '../services/dataService';
 import { CustomerOrder, OrderStatus, AppConfig, getItemEffectiveStatus } from '../types';
-import { getStatusLimitHours } from '../utils';
+import { getStatusLimitHours, getTechReviewStartTime } from '../utils';
 import { STATUS_CONFIG, getDynamicOrderStatusStyle, getPartialStateMetrics } from '../constants';
 import { OrderDetailsModal } from './OrderDetailsModal';
 
@@ -19,7 +18,9 @@ const ThresholdTimer: React.FC<{ order: CustomerOrder, config: AppConfig }> = ({
       const limitHrs = getStatusLimitHours(order.status, config.settings);
       if (limitHrs === 0) return;
       const lastLog = [...order.logs].reverse().find(l => l.status === order.status);
-      const startTime = lastLog ? new Date(lastLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
+      const startTime = order.status === OrderStatus.TECHNICAL_REVIEW
+        ? getTechReviewStartTime(order)
+        : (lastLog ? new Date(lastLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime());
       const elapsedMs = Date.now() - startTime;
       setRemaining((limitHrs * 3600000) - elapsedMs);
     };

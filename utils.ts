@@ -43,6 +43,38 @@ export const getStatusLimitHours = (status: OrderStatus, settings: any): number 
 };
 
 /**
+ * Returns the start timestamp (in ms) for the Technical Review SLA.
+ * The Technical Review SLA starts directly after the order is logged (or rolled back to logged)
+ * and continues until the order moves out of the technical review list.
+ */
+export const getTechReviewStartTime = (order: CustomerOrder | null | undefined): number => {
+    if (!order) return Date.now();
+    if (order.technicalReviewStartedAt) {
+        const t = new Date(order.technicalReviewStartedAt).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    const logs = order.logs || [];
+    for (let i = logs.length - 1; i >= 0; i--) {
+        const l = logs[i];
+        const msg = (l.message || '').toLowerCase();
+        if (l.status === OrderStatus.LOGGED || msg.includes('rollback to logged') || msg.includes('order acquisition')) {
+            const t = new Date(l.timestamp).getTime();
+            if (!isNaN(t) && t > 0) return t;
+        }
+    }
+    if (order.dataEntryTimestamp) {
+        const t = new Date(order.dataEntryTimestamp).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    if (order.orderDate) {
+        const t = new Date(order.orderDate).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    return Date.now();
+};
+
+
+/**
  * Calculates relevance score for auto-complete search across parts, descriptions, and vendors.
  * Exact part number matches score highest (1000), followed by part number prefix (800),
  * description prefix (600), part number substring (400), description substring (200),

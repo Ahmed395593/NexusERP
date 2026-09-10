@@ -300,16 +300,6 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
     let hasActiveTechReview = false;
     let anyAccepted = false;
 
-    // BLANKET ORDER EXEMPTION: Blanket orders skip all margin/status auto-transitions.
-    // They are allowed to proceed through procurement and delivery without margin checks.
-    if (isBlanketOrder) {
-        // Blanket orders still allow tech review transition if items are accepted
-        if ((anyAccepted) && currentStatus === OrderStatus.LOGGED) {
-            return OrderStatus.TECHNICAL_REVIEW;
-        }
-        return currentStatus;
-    }
-
     (items || []).forEach(it => {
         totalRevenue += ((getItemEffectiveQty(it) || 0) * (it.pricePerUnit || 0));
         if (it.isAccepted) anyAccepted = true;
@@ -325,12 +315,24 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
                 if (isModified) hasActiveTechReview = true;
             }
 
-
             it.components.forEach(c => {
                 totalCost += ((c.quantity || 0) * (c.unitCost || 0));
             });
         }
     });
+
+    // Safeguard: Don't auto-transition terminal or manual statuses
+    if ([OrderStatus.REJECTED, OrderStatus.IN_HOLD].includes(currentStatus)) return currentStatus;
+
+    // BLANKET ORDER EXEMPTION: Blanket orders skip all margin/status auto-transitions.
+    // They are allowed to proceed through procurement and delivery without margin checks.
+    if (isBlanketOrder) {
+        // Blanket orders still allow tech review transition if at least one item is accepted or in active tech review
+        if ((hasActiveTechReview || anyAccepted) && currentStatus === OrderStatus.LOGGED) {
+            return OrderStatus.TECHNICAL_REVIEW;
+        }
+        return currentStatus;
+    }
 
     // Multi-currency amendment: when the order is denominated in a non-L.E.
     // currency, the cost side (PO currency) is brought into the order's revenue
@@ -341,9 +343,6 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
 
     const marginAmt = totalRevenue - totalCostInOrderCurrency;
     const markupPct = totalCostInOrderCurrency > 0 ? (marginAmt / totalCostInOrderCurrency) * 100 : (totalRevenue > 0 ? 100 : 0);
-
-    // Safeguard: Don't auto-transition terminal or manual statuses
-    if ([OrderStatus.REJECTED, OrderStatus.IN_HOLD].includes(currentStatus)) return currentStatus;
 
     // Priority 1: Margin Protection (only when costs have been identified)
     if (hasComponents && isMarginBreach(totalCostInOrderCurrency, markupPct, minMargin)) return OrderStatus.NEGATIVE_MARGIN;
@@ -1220,10 +1219,11 @@ const reconcileOrdersMarginOnThresholdChange = (db, oldMinMargin, newMinMargin, 
         const oldStatus = order.status;
         let nextStatus = oldStatus || OrderStatus.LOGGED;
 
+        const isBlanket = Boolean(order.blanketOrder || order.contractId || order.blanketContractId);
         if (order.customerName !== 'Internal Stock') {
-            nextStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            nextStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, isBlanket);
         } else {
-            const calculatedStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            const calculatedStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, isBlanket);
             if (calculatedStatus === OrderStatus.NEGATIVE_MARGIN) {
                 const hasComponents = (order.items || []).some(i => i.components && i.components.length > 0);
                 if (hasComponents && oldStatus === OrderStatus.LOGGED) {
@@ -1364,10 +1364,37 @@ const handleStockReceipts = (oldOrder, newOrder, db) => {
     });
 };
 
+const getTechReviewStartTime = (order) => {
+    if (!order) return Date.now();
+    if (order.technicalReviewStartedAt) {
+        const t = new Date(order.technicalReviewStartedAt).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    const logs = order.logs || [];
+    for (let i = logs.length - 1; i >= 0; i--) {
+        const l = logs[i];
+        const msg = (l.message || '').toLowerCase();
+        if (l.status === 'LOGGED' || msg.includes('rollback to logged') || msg.includes('order acquisition')) {
+            const t = new Date(l.timestamp).getTime();
+            if (!isNaN(t) && t > 0) return t;
+        }
+    }
+    if (order.dataEntryTimestamp) {
+        const t = new Date(order.dataEntryTimestamp).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    if (order.orderDate) {
+        const t = new Date(order.orderDate).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    return Date.now();
+};
+
 const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipStatusEval = false) => {
     // 1. Ensure basic structures
     if (!order.logs) order.logs = [];
     if (!order.items) order.items = [];
+    if (!order.status) order.status = OrderStatus.LOGGED;
 
     // 1b. Multi-currency defaults — every order is implicitly denominated in
     //     'L.E.' with conversionRate = 1 unless explicitly set. This mirrors
@@ -1381,6 +1408,7 @@ const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipSta
     if (isNew) {
         if (!order.internalOrderNumber) order.internalOrderNumber = generateInternalOrderNumber(db);
         if (!order.dataEntryTimestamp) order.dataEntryTimestamp = new Date().toISOString();
+        if (!order.technicalReviewStartedAt) order.technicalReviewStartedAt = order.dataEntryTimestamp;
         if (order.logs.length === 0) {
             order.logs.push(createAuditLog('Order acquisition recorded', OrderStatus.LOGGED, user));
         }
@@ -1520,14 +1548,15 @@ const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipSta
 
         // Skip margin check for Internal Stock orders (they always have 0 revenue)
         let nextStatus = order.status || OrderStatus.LOGGED;
+        const isBlanket = Boolean(order.blanketOrder || order.contractId || order.blanketContractId);
         if (order.customerName !== 'Internal Stock') {
-            nextStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            nextStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, isBlanket);
         } else {
             // For Internal Stock, standard transitions apply (e.g. LOGGED -> TECH REVIEW if components exist)
             // We reuse evaluateMarginStatus logic BUT purely for workflow transitions, ignoring negative margin return
             // Actually, evaluateMarginStatus prioritizes margin check. Let's replicate strict workflow logic here or modify evaluateMarginStatus.
             // Simpler: Just allow negative margin if it's internal stock.
-            const calculatedStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            const calculatedStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, isBlanket);
             if (calculatedStatus === OrderStatus.NEGATIVE_MARGIN) {
                 // Fallback: If it blocked on margin, check if it should proceed to Tech Review
                 const hasComponents = (order.items || []).some(i => i.components && i.components.length > 0);
@@ -1997,8 +2026,13 @@ const runThresholdAudit = async () => {
             const limitHrs = settings[thresholdKey];
             const groupIds = settings.thresholdNotifications?.[thresholdKey] || [];
             if (limitHrs > 0 && groupIds.length > 0) {
-                const lastStatusLog = [...(order.logs || [])].reverse().find(l => l.status === order.status);
-                const statusEnteredAt = lastStatusLog ? new Date(lastStatusLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
+                let statusEnteredAt;
+                if (order.status === OrderStatus.TECHNICAL_REVIEW) {
+                    statusEnteredAt = getTechReviewStartTime(order);
+                } else {
+                    const lastStatusLog = [...(order.logs || [])].reverse().find(l => l.status === order.status);
+                    statusEnteredAt = lastStatusLog ? new Date(lastStatusLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
+                }
                 const elapsedHrs = (Date.now() - statusEnteredAt) / (1000 * 60 * 60);
                 if (elapsedHrs > limitHrs) {
                     const label = THRESHOLD_LABELS[thresholdKey] || thresholdKey;
@@ -2223,17 +2257,22 @@ const calculateOrderHealth = (order, settings) => {
     if (limitKey) {
         const limitHrs = settings[limitKey];
         if (limitHrs > 0) {
-            const logs = order.logs || [];
-            let earliestLog = null;
-            // Iterate backwards to find the start of the current status block
-            for (let i = logs.length - 1; i >= 0; i--) {
-                if (logs[i].status === order.status) {
-                    earliestLog = logs[i];
-                } else {
-                    break;
+            let statusEnteredAt;
+            if (order.status === OrderStatus.TECHNICAL_REVIEW) {
+                statusEnteredAt = getTechReviewStartTime(order);
+            } else {
+                const logs = order.logs || [];
+                let earliestLog = null;
+                // Iterate backwards to find the start of the current status block
+                for (let i = logs.length - 1; i >= 0; i--) {
+                    if (logs[i].status === order.status) {
+                        earliestLog = logs[i];
+                    } else {
+                        break;
+                    }
                 }
+                statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             }
-            const statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             const elapsedHrs = (Date.now() - statusEnteredAt) / (1000 * 60 * 60);
 
 
@@ -2879,6 +2918,7 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                     order.status = OrderStatus.WAITING_SUPPLIERS;
                 }
 
+                order.technicalReviewFinishedAt = new Date().toISOString();
                 order.logs.push(createAuditLog('Technical study finalized and pushed to Procurement', order.status, user));
                 break;
 
@@ -2891,6 +2931,8 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 order.dataEntryTimestamp = nowIso;
                 order.orderDate = todayDate;
                 order.statusUpdatedAt = nowIso;
+                order.technicalReviewStartedAt = nowIso;
+                delete order.technicalReviewFinishedAt;
                 order.loggingComplianceViolation = false;
                 delete order.statusEnteredAt;
                 delete order.lastStatusChange;
@@ -3044,6 +3086,9 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 order.customerReferenceNumber = `rej_${today}_${oldCustRef}`;
                 
                 order.status = OrderStatus.REJECTED;
+                if (!order.technicalReviewFinishedAt && [OrderStatus.LOGGED, OrderStatus.TECHNICAL_REVIEW, OrderStatus.NEGATIVE_MARGIN].includes(oldStatus)) {
+                    order.technicalReviewFinishedAt = new Date().toISOString();
+                }
                 // Release any reserved inventory back to free stock
                 order.items.forEach(item => {
                     (item.components || []).forEach(comp => {
@@ -3061,7 +3106,13 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 if (taItemIdx === -1) throw new Error("Item not found");
                 const taItem = order.items[taItemIdx];
                 taItem.isAccepted = !taItem.isAccepted;
-                order.logs.push(createAuditLog(`Item ${taItem.orderNumber}: ${taItem.isAccepted ? 'Accepted' : 'Acceptance Revoked'}`, order.status, user));
+
+                const hasAnyAccepted = order.items.some(i => i.isAccepted);
+                if (hasAnyAccepted && order.status === OrderStatus.LOGGED) {
+                    order.status = OrderStatus.TECHNICAL_REVIEW;
+                }
+
+                order.logs.push(createAuditLog(`Item ${taItem.orderNumber || (taItemIdx + 1)}: ${taItem.isAccepted ? 'Accepted' : 'Acceptance Revoked'}`, order.status, user));
                 break;
             }
 

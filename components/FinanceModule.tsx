@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { dataService } from '../services/dataService';
 import { CustomerOrder, Customer, Supplier, OrderStatus, AppConfig, User, getItemEffectiveStatus } from '../types';
-import { getItemEffectiveQty, getOrderConversionRate, getOrderCurrency, getStatusLimitHours } from '../utils';
+import { getItemEffectiveQty, getOrderConversionRate, getOrderCurrency, getStatusLimitHours, getTechReviewStartTime } from '../utils';
 import { isMarginBreach } from '../shared/margin';
 import { STATUS_CONFIG, getDynamicOrderStatusStyle } from '../constants';
 import { jsPDF } from 'jspdf';
@@ -63,7 +63,9 @@ const ThresholdSentinel: React.FC<{ order: CustomerOrder, config: AppConfig }> =
       const limitHrs = getStatusLimit(order, config.settings);
       if (limitHrs === 0) return;
       const lastLog = [...order.logs].reverse().find(l => l.status === order.status);
-      const startTime = lastLog ? new Date(lastLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
+      const startTime = order.status === OrderStatus.TECHNICAL_REVIEW
+        ? getTechReviewStartTime(order)
+        : (lastLog ? new Date(lastLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime());
       const elapsedMs = Date.now() - startTime;
       setRemaining((limitHrs * 3600000) - elapsedMs);
     };
