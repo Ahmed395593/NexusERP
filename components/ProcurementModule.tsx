@@ -302,7 +302,7 @@ export const extractCostSheetMetrics = (base64Data: string): { resourceCount: nu
 
     for (let r = 0; r < data.length; r++) {
       const row = data[r] || [];
-      const cell0 = String(row[nameCol] || '').trim();
+      const cell0 = String(row[nameCol] || '').replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
       if (!cell0) continue;
 
       const isSummaryOrHeader = 
@@ -325,7 +325,9 @@ export const extractCostSheetMetrics = (base64Data: string): { resourceCount: nu
             invoiceTotal = numInv;
           }
         }
-      } else {
+      } else if (/\p{L}/u.test(cell0)) {
+        // Only rows whose first column holds an actual name (contains a letter)
+        // count as working resources — never blank / spacer rows.
         resourceCount++;
       }
     }
@@ -339,6 +341,185 @@ export const extractCostSheetMetrics = (base64Data: string): { resourceCount: nu
     console.error('[CostSheet] Extraction error:', e);
     return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
   }
+};
+
+/** True when a first-column label carries the Arabic word "اجمالى" (total) in any spelling. */
+const costSheetLabelIsTotal = (raw: string): boolean =>
+  /(?:ا|إ)جمال/.test(String(raw || ''));
+
+/** Remove the "اجمالى/اجمالي/الإجمالي/..." token from a total-row label, leaving the project name. */
+const stripTotalWord = (raw: string): string =>
+  String(raw || '')
+    .replace(/[ً-ْ]/g, '')
+    .replace(/ال(?:ا|إ)جمالي?ى?/g, ' ')
+    .replace(/(?:ا|إ)جمالي?ى?/g, ' ')
+    .replace(/[:\-–—_/\\]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/** Normalise a project name for tolerant matching (case, diacritics, punctuation, Arabic alef/ya forms). */
+const normalizeProjectName = (raw: string): string =>
+  stripTotalWord(raw)
+    .toLowerCase()
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+type CostSheetProjectBlock = { name: string; resourceCount: number; realCost: number };
+
+const _costSheetBlocksCache = new Map<string, CostSheetProjectBlock[]>();
+
+/**
+ * Parse an uploaded outsourcing cost sheet into its per-project blocks.
+ *
+ * Sheet shape (per the outsourcing template): the first column lists the working
+ * persons of a project, one per row; immediately after a project's people comes a
+ * row whose first-column label contains the word "اجمالى" followed by (or preceded
+ * by, for Latin names) the project name. That row closes the project block.
+ *
+ * Each returned block carries:
+ *   - name:          the project name (the اجمالى label with the total word removed)
+ *   - resourceCount: number of person rows in the block — rows whose first column
+ *                    holds a real name (non-empty, contains a letter). Blank spacer
+ *                    rows between the last person and the اجمالى row are NOT counted.
+ *   - realCost:      sum of those person rows in the sheet's right-most non-empty
+ *                    (numeric) column
+ */
+const parseCostSheetProjectBlocks = (base64Data: string): CostSheetProjectBlock[] => {
+  if (!base64Data) return [];
+  const cacheKey = `${base64Data.length}::${base64Data.slice(-128)}`;
+  if (_costSheetBlocksCache.has(cacheKey)) return _costSheetBlocksCache.get(cacheKey)!;
+
+  let blocks: CostSheetProjectBlock[] = [];
+  try {
+    const cleanBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
+    const wb = XLSX.read(cleanBase64, { type: 'base64' });
+    const sheetName = wb.SheetNames[0];
+    const sheet = sheetName ? wb.Sheets[sheetName] : undefined;
+    const data: any[][] = sheet ? XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' }) : [];
+    if (data.length) {
+
+    // Strip zero-width / BOM characters so a "blank" spacer cell reads as empty.
+    const cellText = (v: any): string => String(v == null ? '' : v).replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
+    const toNumber = (v: any): number => {
+      if (typeof v === 'number') return isFinite(v) ? v : 0;
+      const parsed = parseFloat(cellText(v).replace(/[,\s]/g, ''));
+      return isNaN(parsed) ? 0 : parsed;
+    };
+
+    // Name column: the first column by spec, unless it is entirely blank.
+    let nameCol = 0;
+    if (!data.some(r => cellText((r || [])[0]) !== '') && data.some(r => cellText((r || [])[1]) !== '')) {
+      nameCol = 1;
+    }
+
+    const isSubHeader = (label: string): boolean => {
+      const v = label.toLowerCase();
+      return v === '' || [
+        'الاسم', 'اسم', 'م', 'name', 'كشف', 'تقرير', 'report', 'sheet',
+        'رقم', 'الرقم', 'مسلسل', 'no', 'no.', 'sr', 's/n', '#',
+      ].includes(v);
+    };
+    const rowHasNumber = (row: any[]): boolean => {
+      for (let c = nameCol + 1; c < row.length; c += 1) {
+        const txt = cellText(row[c]);
+        if (txt !== '' && !isNaN(parseFloat(txt.replace(/[,\s]/g, '')))) return true;
+      }
+      return false;
+    };
+    // A person row is one whose first column holds a real name: non-empty and
+    // containing at least one letter. Blank / punctuation-only spacer rows and
+    // the اجمالى total row are excluded.
+    const isPersonRow = (label: string): boolean =>
+      label !== '' && /\p{L}/u.test(label) && !costSheetLabelIsTotal(label) && !isSubHeader(label);
+
+    // Right-most non-empty column across the person rows that carry a number.
+    let lastCol = nameCol;
+    for (const r of data) {
+      const row = r || [];
+      if (!isPersonRow(cellText(row[nameCol])) || !rowHasNumber(row)) continue;
+      for (let c = row.length - 1; c > nameCol; c -= 1) {
+        if (cellText(row[c]) !== '') { if (c > lastCol) lastCol = c; break; }
+      }
+    }
+      let curCount = 0;
+      let curSum = 0;
+      for (const r of data) {
+        const row = r || [];
+        const label = cellText(row[nameCol]);
+        if (label === '') continue;
+        if (costSheetLabelIsTotal(label)) {
+          blocks.push({ name: stripTotalWord(label), resourceCount: curCount, realCost: curSum });
+          curCount = 0;
+          curSum = 0;
+          continue;
+        }
+        if (!isPersonRow(label)) continue;
+        curCount += 1;
+        curSum += lastCol > nameCol ? toNumber(row[lastCol]) : 0;
+      }
+      if (curCount > 0) blocks.push({ name: '', resourceCount: curCount, realCost: curSum });
+    }
+  } catch (e) {
+    console.error('[CostSheet] Block parse error:', e);
+    blocks = [];
+  }
+
+  _costSheetBlocksCache.set(cacheKey, blocks);
+  return blocks;
+};
+
+const findCostSheetProjectBlock = (blocks: CostSheetProjectBlock[], projectName: string): CostSheetProjectBlock | null => {
+  const target = normalizeProjectName(projectName);
+  if (!target || !blocks.length) return null;
+  let match = blocks.find(b => normalizeProjectName(b.name) === target);
+  if (!match) {
+    match = blocks.find(b => {
+      const n = normalizeProjectName(b.name);
+      return n !== '' && (n.includes(target) || target.includes(n));
+    });
+  }
+  return match || null;
+};
+
+/**
+ * Per-project figures for the outsourcing card. Returns null when `projectName`
+ * has no matching "اجمالى <project>" block in the sheet.
+ */
+export const extractCostSheetProjectMetrics = (
+  base64Data: string,
+  projectName: string,
+): { resourceCount: number; realCost: number; projectName: string } | null => {
+  if (!base64Data || !projectName || !projectName.trim()) return null;
+  const match = findCostSheetProjectBlock(parseCostSheetProjectBlocks(base64Data), projectName);
+  if (!match) return null;
+  return {
+    resourceCount: match.resourceCount,
+    realCost: Math.round(match.realCost * 100) / 100,
+    projectName: match.name.trim(),
+  };
+};
+
+/**
+ * Check whether an uploaded cost sheet contains a block for `projectName`.
+ * `available` lists the named project blocks found in the sheet (for messaging).
+ * `hasBlocks` is false for a sheet with no "اجمالى ..." rows at all (not a
+ * recognisable per-project cost sheet).
+ */
+export const costSheetContainsProject = (
+  base64Data: string,
+  projectName: string,
+): { matched: boolean; hasBlocks: boolean; available: string[] } => {
+  const blocks = parseCostSheetProjectBlocks(base64Data);
+  const named = blocks.filter(b => b.name.trim() !== '');
+  return {
+    matched: Boolean(findCostSheetProjectBlock(blocks, projectName)),
+    hasBlocks: named.length > 0,
+    available: named.map(b => b.name.trim()),
+  };
 };
 
 /**
@@ -538,10 +719,13 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   // Frozen header measurement for the cost-sheet grid (rows 2-4 + column A stay fixed).
   const costSheetTheadRef = useRef<HTMLTableSectionElement>(null);
   const costSheetStubRef = useRef<HTMLTableCellElement>(null);
-  const costSheetRowRef = useRef<HTMLTableRowElement>(null);
   const [costSheetFrozenTop, setCostSheetFrozenTop] = useState(0);
   const [costSheetFrozenLeft, setCostSheetFrozenLeft] = useState(0);
-  const [costSheetRowHeight, setCostSheetRowHeight] = useState(0);
+  // Frozen rows/cells are collapsed to a compact height so they only show their text.
+  // Value is the full rendered row box (input + 2px top/bottom cell borders) so the
+  // stacked sticky offsets for frozen rows 2-4 line up exactly.
+  const COST_SHEET_FROZEN_ROW_HEIGHT = 34;
+  const COST_SHEET_FROZEN_INPUT_HEIGHT = COST_SHEET_FROZEN_ROW_HEIGHT - 4;
   const [noRfpOverrides, setNoRfpOverrides] = useState<Record<string, boolean>>({});
   const [eraseWrongDataByOrder, setEraseWrongDataByOrder] = useState<Record<string, boolean>>({});
 
@@ -632,7 +816,6 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
     requestAnimationFrame(() => {
       if (costSheetTheadRef.current) setCostSheetFrozenTop(costSheetTheadRef.current.offsetHeight);
       if (costSheetStubRef.current) setCostSheetFrozenLeft(costSheetStubRef.current.offsetWidth);
-      if (costSheetRowRef.current) setCostSheetRowHeight(costSheetRowRef.current.offsetHeight);
     });
   }, [costSheetWorkbook, costSheetSheetName]);
 
@@ -756,6 +939,24 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
     setCostSheetFileChanged(false);
   };
 
+  // After a cost sheet is uploaded for an order that has a project name, warn if
+  // that project has no matching "اجمالى <project>" block in the uploaded sheet.
+  const warnIfProjectMissingFromCostSheet = (order: CustomerOrder | null | undefined, dataUrl: string) => {
+    if (!order || !dataUrl) return;
+    const projName = getOrderProjName(order);
+    if (!projName) return;
+    const res = costSheetContainsProject(dataUrl, projName);
+    if (res.matched) return;
+    const detail = res.available.length
+      ? t('procurement.costSheet.projectsFoundList', { list: res.available.join('، ') })
+      : t('procurement.costSheet.noProjectBlocks');
+    alert([
+      t('procurement.costSheet.projectNotFoundTitle', { project: projName }),
+      detail,
+      t('procurement.costSheet.pleaseUploadMatching'),
+    ].join('\n\n'));
+  };
+
   const handleCostSheetFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !costSheetModalOrder || !costSheetModalSelectedItemId) return;
@@ -769,6 +970,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
         const updatedItem = updated.items.find(i => i.id === costSheetModalSelectedItemId);
         if (updatedItem) loadCostSheetItem(updatedItem);
         await fetchData();
+        warnIfProjectMissingFromCostSheet(costSheetModalOrder, result);
       } catch (err: any) {
         alert(err.message || 'Failed to upload cost sheet');
       } finally {
@@ -805,6 +1007,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
         await dataService.uploadCostSheet(order.id, itemId, result, file.name, undefined, undefined, replaceWrongData);
         await fetchData();
         alert(`Cost sheet '${file.name}' successfully uploaded for order ${order.internalOrderNumber || order.customerReferenceNumber}.`);
+        warnIfProjectMissingFromCostSheet(order, result);
       } catch (err: any) {
         alert(err.message || 'Failed to upload cost sheet.');
       } finally {
@@ -2525,17 +2728,41 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
 
                 const targetItem = o.items.find(item => item.costSheetFile) || o.items.find(item => item.productionType === 'OUTSOURCING') || o.items[0];
                 const outsourcingMetrics = (() => {
-                  if (!targetItem) return { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+                  if (!targetItem) return { resourceCount: 0, realCost: 0, invoiceTotal: 0, sheetProjectName: '', projectMissing: false };
                   let count = targetItem.workingResourceCount || 0;
                   let cost = targetItem.realCost || 0;
                   let inv = targetItem.invoiceTotal || 0;
-                  if ((!count || !cost) && targetItem.costSheetFile) {
+                  let sheetProjectName = '';
+                  let matchedProjectBlock = false;
+                  let projectMissing = false;
+
+                  // Per-project figures from the uploaded cost sheet take precedence:
+                  // match this order's project name to its "اجمالى <project>" block in the
+                  // sheet, then show that block's person count + sum of the right-most column.
+                  const projName = getOrderProjName(o);
+                  if (projName && targetItem.costSheetFile) {
+                    const projMetrics = extractCostSheetProjectMetrics(targetItem.costSheetFile, projName);
+                    if (projMetrics) {
+                      count = projMetrics.resourceCount;
+                      cost = projMetrics.realCost;
+                      sheetProjectName = projMetrics.projectName;
+                      matchedProjectBlock = true;
+                    } else {
+                      // The order names a project but the uploaded sheet has no block for
+                      // it — show 0/0, never the whole-sheet all-projects totals.
+                      count = 0;
+                      cost = 0;
+                      projectMissing = true;
+                    }
+                  }
+
+                  if (!matchedProjectBlock && !projectMissing && (!count || !cost) && targetItem.costSheetFile) {
                     const extracted = extractCostSheetMetrics(targetItem.costSheetFile);
                     if (!count) count = extracted.resourceCount;
                     if (!cost) cost = extracted.realCost;
                     if (!inv) inv = extracted.invoiceTotal;
                   }
-                  return { resourceCount: count, realCost: cost, invoiceTotal: inv };
+                  return { resourceCount: count, realCost: cost, invoiceTotal: inv, sheetProjectName, projectMissing };
                 })();
 
                 return (
@@ -2636,7 +2863,16 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                             </div>
 
                             {/* Working Number of Resources */}
-                            <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-xl text-emerald-900 shadow-xs">
+                            <div
+                              className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-xl text-emerald-900 shadow-xs"
+                              title={
+                                outsourcingMetrics.projectMissing
+                                  ? `Project "${getOrderProjName(o)}" is not in the uploaded cost sheet — upload a sheet that contains it.`
+                                  : outsourcingMetrics.sheetProjectName
+                                    ? `From cost sheet project "${outsourcingMetrics.sheetProjectName}" (اجمالى block)`
+                                    : undefined
+                              }
+                            >
                               <i className="fa-solid fa-users text-emerald-600 text-xs"></i>
                               <div className="flex flex-col">
                                 <span className="text-[8px] font-black uppercase tracking-wider text-emerald-700 leading-none">
@@ -2649,7 +2885,16 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                             </div>
 
                             {/* Total Real Cost to Company */}
-                            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 px-3 py-1.5 rounded-xl text-blue-900 shadow-xs">
+                            <div
+                              className="flex items-center gap-2 bg-blue-50 border border-blue-200 px-3 py-1.5 rounded-xl text-blue-900 shadow-xs"
+                              title={
+                                outsourcingMetrics.projectMissing
+                                  ? `Project "${getOrderProjName(o)}" is not in the uploaded cost sheet — upload a sheet that contains it.`
+                                  : outsourcingMetrics.sheetProjectName
+                                    ? `Sum of project "${outsourcingMetrics.sheetProjectName}" person rows (right-most column) from the uploaded cost sheet`
+                                    : undefined
+                              }
+                            >
                               <i className="fa-solid fa-coins text-blue-600 text-xs"></i>
                               <div className="flex flex-col">
                                 <span className="text-[8px] font-black uppercase tracking-wider text-blue-700 leading-none">
@@ -4143,13 +4388,13 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                               {costSheetCells.map((row, rowIndex) => {
                                 const frozenRowNumber = rowIndex + 1 + costSheetRowOffset;
                                 const isFrozenRow = [2, 3, 4].includes(frozenRowNumber);
-                                const frozenStickyTop = isFrozenRow ? costSheetFrozenTop + (frozenRowNumber - 2) * costSheetRowHeight : 0;
+                                const frozenStickyTop = isFrozenRow ? costSheetFrozenTop + (frozenRowNumber - 2) * COST_SHEET_FROZEN_ROW_HEIGHT : 0;
                                 return (
-                                <tr key={rowIndex} ref={rowIndex === 0 ? costSheetRowRef : undefined}>
+                                <tr key={rowIndex}>
                                   <td
-                                    className="sticky left-0 z-10 bg-slate-100 border-r-2 border-black text-right px-3 py-2 text-[11px] font-black text-slate-500"
+                                    className={`sticky left-0 z-10 bg-slate-100 border-r-2 border-black text-right px-3 text-[11px] font-black text-slate-500 ${isFrozenRow ? 'py-0' : 'py-2'}`}
                                     style={isFrozenRow
-                                      ? { position: 'sticky', top: frozenStickyTop, zIndex: 30 }
+                                      ? { position: 'sticky', top: frozenStickyTop, zIndex: 30, height: COST_SHEET_FROZEN_ROW_HEIGHT, lineHeight: `${COST_SHEET_FROZEN_INPUT_HEIGHT}px`, verticalAlign: 'middle' }
                                       : undefined}
                                   >
                                     {rowIndex + 1 + costSheetRowOffset}
@@ -4172,8 +4417,12 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                       cellStickyStyle.position = 'sticky';
                                       cellStickyStyle.backgroundColor = cellBg || '#ffffff';
                                       cellStickyStyle.zIndex = isFrozenRow && frozenCol ? 30 : 20;
-                                      if (isFrozenRow) cellStickyStyle.top = costSheetFrozenTop + (frozenRowNumber - 2) * costSheetRowHeight;
+                                      if (isFrozenRow) cellStickyStyle.top = costSheetFrozenTop + (frozenRowNumber - 2) * COST_SHEET_FROZEN_ROW_HEIGHT;
                                       if (frozenCol) cellStickyStyle.left = costSheetFrozenLeft;
+                                    }
+                                    if (isFrozenRow) {
+                                      cellStickyStyle.height = COST_SHEET_FROZEN_ROW_HEIGHT;
+                                      cellStickyStyle.verticalAlign = 'middle';
                                     }
                                     return (
                                       <td
@@ -4185,11 +4434,20 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                           readOnly={!isEditableEffective}
                                           value={displayValue === undefined || displayValue === null ? '' : String(displayValue)}
                                           onChange={e => { if (isEditableEffective) updateCostSheetCell(rowIndex, colIndex, e.target.value); }}
-                                          className={`w-full min-w-[120px] h-12 px-3 text-sm outline-none focus:ring-2 focus:border-sky-500 border-none ${isEditableEffective ? '' : 'cursor-not-allowed'}`}
+                                          className={`w-full min-w-[120px] ${isFrozenRow ? '' : 'h-12'} px-3 text-sm outline-none focus:ring-2 focus:border-sky-500 border-none ${isEditableEffective ? '' : 'cursor-not-allowed'}`}
                                           style={{
                                             backgroundColor: cellBg || 'transparent',
                                             color: cell.fontColor || '#1e293b',
                                             fontWeight: cell.fontBold ? 700 : undefined,
+                                            ...(isFrozenRow ? {
+                                              display: 'block',
+                                              height: COST_SHEET_FROZEN_INPUT_HEIGHT,
+                                              minHeight: COST_SHEET_FROZEN_INPUT_HEIGHT,
+                                              lineHeight: `${COST_SHEET_FROZEN_INPUT_HEIGHT}px`,
+                                              paddingTop: 0,
+                                              paddingBottom: 0,
+                                              boxSizing: 'border-box',
+                                            } : {}),
                                           }}
                                         />
                                       </td>

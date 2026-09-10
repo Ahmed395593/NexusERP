@@ -161,6 +161,12 @@ export const translations: Record<string, any> = {
         sheetHistory: 'Cost Sheet History',
         noSheetUploaded: 'No cost sheet uploaded yet',
       },
+      costSheet: {
+        projectNotFoundTitle: 'Project "{{project}}" was not found in the uploaded cost sheet.',
+        projectsFoundList: 'Projects found in this sheet: {{list}}.',
+        noProjectBlocks: 'This file has no project total rows ("اجمالى ...").',
+        pleaseUploadMatching: 'Please upload a cost sheet that contains this project.',
+      },
       sort: {
         prioritySort: 'Priority Sort', poReceived: 'PO Received', entity: 'Entity', poHash: 'PO #', intId: 'Int ID',
       },
@@ -411,6 +417,12 @@ export const translations: Record<string, any> = {
         downloadSheet: 'تحميل الشيت',
         sheetHistory: 'سجل شيتات التكاليف',
         noSheetUploaded: 'لم يتم رفع شيت تكاليف بعد',
+      },
+      costSheet: {
+        projectNotFoundTitle: 'المشروع "{{project}}" غير موجود في شيت التكاليف المرفوع.',
+        projectsFoundList: 'المشاريع الموجودة في هذا الشيت: {{list}}.',
+        noProjectBlocks: 'لا يحتوي هذا الملف على صفوف إجمالي للمشاريع ("اجمالى ...").',
+        pleaseUploadMatching: 'من فضلك ارفع شيت تكاليف يحتوي على هذا المشروع.',
       },
       sort: {
         prioritySort: 'ترتيب الأولوية', poReceived: 'استلام أمر الشراء', entity: 'الجهة', poHash: 'رقم أمر الشراء', intId: 'رقم داخلي',
