@@ -3025,7 +3025,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                           <>
                             {readyForPo && allOrderProcurementAwarded && (
                               <button
-                                disabled={o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded}
+                                disabled={(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded}
                                 onClick={async (e) => {
                                   e.stopPropagation();
                                   const po = await dataService.getUniquePoNumber();
@@ -3042,7 +3042,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                     setActiveAction({ type: 'PO', order: o, item: sameSupplier[0].item, comp: sameSupplier[0].comp });
                                   }
                                 }}
-                                className={`px-5 py-2.5 rounded-xl text-[10px] font-black uppercase shadow-lg flex items-center gap-2 transition-all ${o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-100'
+                                className={`px-5 py-2.5 rounded-xl text-[10px] font-black uppercase shadow-lg flex items-center gap-2 transition-all ${(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-100'
                                   }`}
                               >
                                 <i className="fa-solid fa-file-invoice"></i> {t('procurement.po.issuePOAll')}
@@ -3434,7 +3434,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
 
                                         {allOrderProcurementAwarded && (
                                           <button
-                                            disabled={o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded}
+                                            disabled={(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded}
                                             onClick={async () => {
                                               const po = await dataService.getUniquePoNumber();
                                               setPoNumberInput(po);
@@ -3450,7 +3450,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                               setContractStartDate(contractInfo.contractStartDate);
                                               setActiveAction({ type: 'PO', order: o, item: i, comp: c });
                                             }}
-                                            className={`px-4 py-2 rounded-lg text-[9px] font-black uppercase shadow-sm transition-all ${o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed grayscale' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+                                            className={`px-4 py-2 rounded-lg text-[9px] font-black uppercase shadow-sm transition-all ${(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed grayscale' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
                                           >
                                             Issue PO
                                           </button>
@@ -3467,7 +3467,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                           Reset Award
                                         </button>
                                       </div>
-                                      {o.status === OrderStatus.NEGATIVE_MARGIN && (
+                                      {o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o) && (
                                         <div className="flex items-center gap-1.5 text-[8px] font-black text-rose-500 uppercase animate-pulse">
                                           <i className="fa-solid fa-triangle-exclamation"></i>
                                           {t('procurement.actions.financialBreach')}

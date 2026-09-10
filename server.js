@@ -331,6 +331,10 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
         if ((hasActiveTechReview || anyAccepted) && currentStatus === OrderStatus.LOGGED) {
             return OrderStatus.TECHNICAL_REVIEW;
         }
+        // If a blanket order somehow had NEGATIVE_MARGIN (e.g. legacy data), auto-recover it!
+        if (currentStatus === OrderStatus.NEGATIVE_MARGIN) {
+            return (hasActiveTechReview || anyAccepted) ? OrderStatus.TECHNICAL_REVIEW : OrderStatus.LOGGED;
+        }
         return currentStatus;
     }
 
@@ -344,8 +348,8 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
     const marginAmt = totalRevenue - totalCostInOrderCurrency;
     const markupPct = totalCostInOrderCurrency > 0 ? (marginAmt / totalCostInOrderCurrency) * 100 : (totalRevenue > 0 ? 100 : 0);
 
-    // Priority 1: Margin Protection (only when costs have been identified)
-    if (hasComponents && isMarginBreach(totalCostInOrderCurrency, markupPct, minMargin)) return OrderStatus.NEGATIVE_MARGIN;
+    // Priority 1: Margin Protection (only when costs have been identified, exempting blanket orders)
+    if (hasComponents && isMarginBreach(totalCostInOrderCurrency, markupPct, minMargin, isBlanketOrder)) return OrderStatus.NEGATIVE_MARGIN;
 
     // Priority 2: Technical Workflow Transition
     if ((hasActiveTechReview || anyAccepted) && currentStatus === OrderStatus.LOGGED) {
@@ -379,6 +383,8 @@ const canIssuePoForOrder = (order, minMargin) => {
     }
 
     if (order.customerName === 'Internal Stock') return true;
+    // Blanket orders are exempt from margin protection checks for PO issuance
+    if (order.blanketOrder || order.contractId || order.blanketContractId) return true;
 
     let totalRevenue = 0;
     let totalCost = 0;
@@ -1180,12 +1186,23 @@ const createAuditLog = (message, status, user) => ({
 });
 
 // One-time repair: orders that were incorrectly blocked as NEGATIVE_MARGIN when no
-// costs had been identified are reset to LOGGED on server start.
-const repairNegativeMarginOrders = (db) => {
+// costs had been identified or when classified as blanket orders are reset.
+const repairNegativeMarginOrders = (db, targetPath = DB_PATH) => {
     if (!db.orders || db.orders.length === 0) return;
     let changed = false;
     db.orders.forEach(order => {
         if (order.status !== OrderStatus.NEGATIVE_MARGIN) return;
+        const isBlanket = Boolean(order.blanketOrder || order.contractId || order.blanketContractId);
+        if (isBlanket) {
+            const hasComponents = (order.items || []).some(i => i.components && i.components.length > 0);
+            const anyAccepted = (order.items || []).some(i => i.isAccepted);
+            order.status = (hasComponents || anyAccepted) ? OrderStatus.TECHNICAL_REVIEW : OrderStatus.LOGGED;
+            order.loggingComplianceViolation = false;
+            if (!order.logs) order.logs = [];
+            order.logs.push(createAuditLog(`[AUTO] Data repair: Blanket order exempt from NEGATIVE_MARGIN restored to ${order.status}`, order.status, 'System'));
+            changed = true;
+            return;
+        }
         const totalCost = (order.items || []).reduce((sum, item) =>
             sum + (item.components || []).reduce((cSum, c) =>
                 cSum + ((c.quantity || 0) * (c.unitCost || 0)), 0), 0);
@@ -1962,8 +1979,8 @@ const runThresholdAudit = async () => {
                 `Order ${order.internalOrderNumber} has been placed ON HOLD. Customer: ${order.customerName}.`);
         }
 
-        // A4. Negative Margin (status-based, not time-based)
-        if (order.status === 'NEGATIVE_MARGIN') {
+        // A4. Negative Margin (status-based, not time-based - exempting blanket orders)
+        if (order.status === 'NEGATIVE_MARGIN' && !order.blanketOrder && !order.contractId && !order.blanketContractId) {
             let totalRevenue = 0, totalCost = 0;
             (order.items || []).forEach(it => {
                 totalRevenue += (getItemEffectiveQty(it) * it.pricePerUnit);
@@ -2307,10 +2324,63 @@ const calculateOrderHealth = (order, settings) => {
     return { ...order, isOverdue };
 };
 
+// --- CUSTOMER WALLET HELPER ---
+// Calculates customer wallet balances (per-project and aggregate total).
+// Blanket orders where the customer has not been invoiced or has not paid yet
+// generate a negative wallet balance (debt: paid - commitment) until paid/settled.
+const computeCustomerWallet = (customer, orders = []) => {
+    if (!customer) return customer;
+    const projectBalances = { ...(customer.walletBalances || {}) };
+
+    // Active blanket orders for this customer (not rejected)
+    const custBlanketOrders = orders.filter(o => 
+        o.customerName === customer.name && 
+        Boolean(o.blanketOrder || o.contractId || o.blanketContractId) &&
+        o.status !== OrderStatus.REJECTED
+    );
+
+    custBlanketOrders.forEach(o => {
+        // If the blanket order is fulfilled/settled, its settlement difference is already in projectBalances
+        if (o.status === OrderStatus.FULFILLED) return;
+
+        let orderGross = 0;
+        let orderCost = 0;
+        (o.items || []).forEach(it => {
+            orderGross += (getItemEffectiveQty(it) || 0) * (it.pricePerUnit || 0) * (1 + ((it.taxPercent || 0) / 100));
+            (it.components || []).forEach(c => {
+                orderCost += (c.quantity || 0) * (c.unitCost || 0);
+            });
+        });
+        if (o.appliesWithholdingTax) orderGross *= 0.99;
+
+        const paid = (o.payments || []).reduce((s, p) => s + (p.amount || 0), 0);
+        const commitment = orderGross > 0 ? orderGross : orderCost;
+
+        // When not invoiced or not fully paid, customer owes the unpaid amount (negative wallet / debt)
+        if (commitment > 0) {
+            const balanceDelta = paid - commitment; // Negative if paid < commitment (debt)
+            const projectKey = String((o.projectName || '').trim()) || '(No Project)';
+            projectBalances[projectKey] = (projectBalances[projectKey] || 0) + balanceDelta;
+        }
+    });
+
+    const totalBalance = Object.values(projectBalances).reduce((sum, val) => sum + (Number(val) || 0), 0);
+    return {
+        ...customer,
+        walletBalance: Math.round(totalBalance * 100) / 100,
+        walletBalances: projectBalances
+    };
+};
+
 // --- GENERIC CRUD ---
 const getCollection = (col) => (req, res) => {
     const db = getDb(req);
     if (col === 'users') return res.json((db[col] || []).map(({ password, ...u }) => u));
+
+    if (col === 'customers') {
+        const orders = db.orders || [];
+        return res.json((db[col] || []).map(c => computeCustomerWallet(c, orders)));
+    }
 
     if (col === 'orders') {
         const settings = resolveSettings(db, isSandbox(req));
@@ -2355,6 +2425,9 @@ const getItemFromCollection = (col) => (req, res) => {
     if (col === 'users') {
         const { password, ...safe } = item;
         return res.json(safe);
+    }
+    if (col === 'customers') {
+        return res.json(computeCustomerWallet(item, db.orders || []));
     }
     if (col === 'orders') {
         const settings = resolveSettings(db, isSandbox(req));
@@ -4185,20 +4258,25 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 if (customer) {
                     if (!customer.walletBalance) customer.walletBalance = 0;
                     
-                    // If totalDifference < 0: customer paid less, they owe nothing more (order was cheaper)
-                    // If totalDifference > 0: customer paid more, credit their wallet
-                    // If totalDifference = 0: exactly matched, no adjustment needed
-                    if (totalDifference < 0) {
-                        // Order was cheaper - no credit needed, mark as settled
-                        order.logs.push(createAuditLog(`Blanket order settled: Settling order ${settlingOrder.internalOrderNumber} was ${Math.abs(totalDifference).toLocaleString()} ${order.currency} less than original. No wallet credit needed.`, order.status, user));
-                    } else if (totalDifference > 0) {
-                        // Customer overpaid - credit wallet (per-project)
-                        const projectKey = String((order.projectName || settlingOrder.projectName || '').trim()) || '(No Project)';
-                        customer.walletBalance = (customer.walletBalance || 0) + totalDifference; // aggregate
-                        customer.walletBalances = customer.walletBalances || {};
-                        customer.walletBalances[projectKey] = (customer.walletBalances[projectKey] || 0) + totalDifference;
-                        order.logs.push(createAuditLog(`Blanket order settled: ${totalDifference.toLocaleString()} ${order.currency} credited to customer wallet for project "${projectKey}" (new balance: ${customer.walletBalance.toLocaleString()} ${order.currency}). Settling order: ${settlingOrder.internalOrderNumber}`, order.status, user));
-                        settlingOrder.logs.push(createAuditLog(`Settlement completed: ${totalDifference.toLocaleString()} ${order.currency} wallet credit applied from blanket order ${order.internalOrderNumber}`, settlingOrder.status, user));
+                    // walletAdjustment = originalTotal - settlingTotal (-totalDifference)
+                    // If totalDifference < 0 (settling was cheaper): customer has CREDIT (walletAdjustment > 0)
+                    // If totalDifference > 0 (settling was more expensive): customer owes DEBT (walletAdjustment < 0)
+                    // If totalDifference = 0: exact match
+                    const walletAdjustment = -totalDifference;
+                    const projectKey = String((order.projectName || settlingOrder.projectName || '').trim()) || '(No Project)';
+                    customer.walletBalances = customer.walletBalances || {};
+                    customer.walletBalances[projectKey] = (customer.walletBalances[projectKey] || 0) + walletAdjustment;
+                    customer.walletBalance = (customer.walletBalance || 0) + walletAdjustment;
+
+                    if (walletAdjustment > 0) {
+                        // Order was cheaper - credit customer wallet
+                        order.logs.push(createAuditLog(`Blanket order settled: Settling order ${settlingOrder.internalOrderNumber} was ${walletAdjustment.toLocaleString()} ${order.currency} less than original. Credited to customer wallet for project "${projectKey}" (new balance: ${customer.walletBalance.toLocaleString()} ${order.currency}).`, order.status, user));
+                        settlingOrder.logs.push(createAuditLog(`Settlement completed: ${walletAdjustment.toLocaleString()} ${order.currency} wallet credit applied from blanket order ${order.internalOrderNumber}`, settlingOrder.status, user));
+                    } else if (walletAdjustment < 0) {
+                        // Settling order cost more - debit customer wallet (unpaid debt)
+                        const debtAmt = Math.abs(walletAdjustment);
+                        order.logs.push(createAuditLog(`Blanket order settled: Settling order ${settlingOrder.internalOrderNumber} was ${debtAmt.toLocaleString()} ${order.currency} more than original. Debited from customer wallet for project "${projectKey}" as unpaid debt (new balance: ${customer.walletBalance.toLocaleString()} ${order.currency}).`, order.status, user));
+                        settlingOrder.logs.push(createAuditLog(`Settlement completed: ${debtAmt.toLocaleString()} ${order.currency} debt recorded to customer wallet from blanket order ${order.internalOrderNumber}`, settlingOrder.status, user));
                     } else {
                         order.logs.push(createAuditLog(`Blanket order settled: Exact match with ${settlingOrder.internalOrderNumber}. No wallet adjustment needed.`, order.status, user));
                     }

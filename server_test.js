@@ -54,7 +54,7 @@ const OrderStatus = {
     FULFILLED: 'FULFILLED'
 };
 
-const evaluateMarginStatus = (items, minMargin, currentStatus) => {
+const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 1, isBlanketOrder = false) => {
     let totalRevenue = 0;
     let totalCost = 0;
     let hasComponents = false;
@@ -71,13 +71,24 @@ const evaluateMarginStatus = (items, minMargin, currentStatus) => {
         }
     });
 
-    const marginAmt = totalRevenue - totalCost;
-    const markupPct = totalCost > 0 ? (marginAmt / totalCost) * 100 : (totalRevenue > 0 ? 100 : 0);
-
     // Safeguard: Don't auto-transition terminal or manual statuses
     if ([OrderStatus.REJECTED, OrderStatus.IN_HOLD].includes(currentStatus)) return currentStatus;
 
-    // Priority 1: Margin Protection (if components present)
+    // BLANKET ORDER EXEMPTION: Blanket orders skip all margin/status auto-transitions
+    if (isBlanketOrder) {
+        if ((hasComponents || anyAccepted) && currentStatus === OrderStatus.LOGGED) {
+            return OrderStatus.TECHNICAL_REVIEW;
+        }
+        if (currentStatus === OrderStatus.NEGATIVE_MARGIN) {
+            return (hasComponents || anyAccepted) ? OrderStatus.TECHNICAL_REVIEW : OrderStatus.LOGGED;
+        }
+        return currentStatus;
+    }
+
+    const marginAmt = totalRevenue - totalCost;
+    const markupPct = totalCost > 0 ? (marginAmt / totalCost) * 100 : (totalRevenue > 0 ? 100 : 0);
+
+    // Priority 1: Margin Protection (if components present and not blanket order)
     if (hasComponents && markupPct < minMargin) return OrderStatus.NEGATIVE_MARGIN;
 
     // Priority 2: Technical Workflow Transition

@@ -879,7 +879,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
     const costInOrderCurrency = totalCost * rate;
     const marginAmt = totalRevenue - costInOrderCurrency;
     const markupPct = costInOrderCurrency > 0 ? (marginAmt / costInOrderCurrency) * 100 : (totalRevenue > 0 ? 100 : 0);
-    const isViolated = isMarginBreach(costInOrderCurrency, markupPct, config.settings.minimumMarginPct);
+    const isViolated = !isOrderBlanket(selectedOrder) && isMarginBreach(costInOrderCurrency, markupPct, config.settings.minimumMarginPct, isOrderBlanket(selectedOrder));
 
     return {
       revenue: totalRevenue,
@@ -1037,7 +1037,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                       </td>
                       <td className="px-8 py-6">
                         <div className="flex items-center gap-4 justify-end">
-                          {o.status === OrderStatus.NEGATIVE_MARGIN && (
+                          {o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanket(o) && (
                             <span className="px-2 py-0.5 bg-rose-600 text-white text-[8px] font-black uppercase rounded animate-pulse">Margin Breach</span>
                           )}
                           <div className="flex-1 max-w-[100px] h-2 bg-slate-100 rounded-full overflow-hidden">
