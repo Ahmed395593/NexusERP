@@ -132,8 +132,13 @@ When asked to change a feature, land on the row below, not on the file. All line
 - **Server:** `server.js:2280` `GET /api/v1/procurement/history` (cross-order procurement history)
 - **Type:** `ProcurementLine` in `types.ts`
 - **PO reference / project badges:** procurement headers always render the customer's PO ref + project/non-project indicator
-- **Universal multi-field search:** pattern is established here â€” replicate when adding new list views
 - **Cost sheet data population & per-project extraction:** For outsourcing orders, cost sheet metrics (working resource count and total real cost) are extracted per project from the uploaded cost sheet by matching the order's project name to its `"اجمالى <project>"` block (person count + right-most column sum). If an order specifies a project not present in the sheet, it displays 0/0 and warns the user with available sheet projects. Falls back to whole-sheet extraction if no project block is matched.
+- **Cost sheet history, latest active sheet & deletion rollback:**
+  - `targetItem.costSheets[]` maintains full upload history. History chips are displayed in Outsourcing order cards whenever `costSheets.length >= 1`.
+  - The latest uploaded sheet is highlighted (`★ Latest`, green border and ring).
+  - "View Sheet" and "Real Cost to Company" always show and evaluate against the latest uploaded sheet only.
+  - Older historical sheets are download-only and cannot be opened in the interactive editor.
+  - A small Delete button appears under the latest sheet chip. Clicking it triggers `delete-cost-sheet-record` (`server.js:3320`), which removes the record, promotes the previous record as active, restores previous `costSheetFile` and metrics (`workingResourceCount`, `realCost`, `invoiceTotal`), and syncs component costs. When only 1 sheet remains, the Delete button is disabled/dimmed to preserve the active cost sheet.
 
 ### Inventory
 

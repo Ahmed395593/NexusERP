@@ -3316,6 +3316,55 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 break;
             }
 
+            case 'delete-cost-sheet-record': {
+                const dcsItemIdx = order.items.findIndex(i => i.id === payload.itemId);
+                if (dcsItemIdx === -1) throw new Error("Item not found");
+                const dcsItem = order.items[dcsItemIdx];
+
+                if (!dcsItem.costSheets || dcsItem.costSheets.length <= 1) {
+                    throw new Error("Cannot delete the only cost sheet record — at least one must remain.");
+                }
+
+                const recIdx = dcsItem.costSheets.findIndex(r => r.id === payload.recordId);
+                if (recIdx === -1) throw new Error("Cost sheet record not found");
+
+                const deletedRec = dcsItem.costSheets[recIdx];
+                dcsItem.costSheets.splice(recIdx, 1);
+
+                // Promote the new last record as the active sheet
+                const newLatest = dcsItem.costSheets[dcsItem.costSheets.length - 1];
+                dcsItem.costSheetFile = newLatest.fileData || undefined;
+                dcsItem.costSheetFileName = newLatest.fileName || undefined;
+
+                // Re-extract metrics from the newly active sheet
+                let newMetrics = { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+                if (newLatest.fileData) {
+                    try {
+                        newMetrics = extractCostSheetMetrics(newLatest.fileData);
+                    } catch (err) {
+                        console.error("[CostSheet] Failed to extract metrics after delete:", err);
+                    }
+                }
+
+                dcsItem.workingResourceCount = newMetrics.resourceCount || newLatest.workingResourceCount || 0;
+                dcsItem.realCost = newMetrics.realCost || newLatest.realCost || 0;
+                dcsItem.invoiceTotal = newMetrics.invoiceTotal || newLatest.invoiceTotal || 0;
+
+                // Sync to components
+                (dcsItem.components || []).forEach(comp => {
+                    comp.workingResourceCount = dcsItem.workingResourceCount;
+                    comp.realCost = dcsItem.realCost;
+                    comp.invoiceTotal = dcsItem.invoiceTotal;
+                    if (newMetrics.realCost > 0) comp.unitCost = newMetrics.realCost;
+                });
+
+                order.logs.push(createAuditLog(
+                    `Item ${dcsItem.orderNumber || dcsItemIdx + 1}: Cost sheet record deleted (${deletedRec.fileName}, uploaded ${new Date(deletedRec.uploadedAt).toLocaleDateString()}). Reverted to: ${newLatest.fileName}.`,
+                    order.status,
+                    user
+                ));
+                break;
+            }
 
             case 'receive-component': {
                 const itemIdx = order.items.findIndex(i => i.id === payload.itemId);

@@ -432,6 +432,10 @@ class DataService {
     return this.dispatchAction(orderId, 'update-cost-sheet-text', { itemId, costSheetText });
   }
 
+  async deleteCostSheetRecord(orderId: string, itemId: string, recordId: string) {
+    return this.dispatchAction(orderId, 'delete-cost-sheet-record', { itemId, recordId });
+  }
+
   async addComponentToItem(orderId: string, itemId: string, comp: Omit<ManufacturingComponent, 'id' | 'statusUpdatedAt' | 'componentNumber'>) {
     return this.dispatchAction(orderId, 'add-component', { itemId, component: comp });
   }
