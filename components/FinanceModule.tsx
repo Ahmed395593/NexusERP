@@ -772,6 +772,18 @@ const FinanceModuleInner: React.FC<FinanceModuleProps> = ({ config, refreshKey, 
   const isOrderBlanket = useCallback((order: CustomerOrder): boolean =>
     !!(order.blanketOrder || order.contractId || order.blanketContractId), []);
 
+  // Mirrors ProcurementModule's "No RFP Needed" determination (minus its
+  // session-local checkbox-override cache, which isn't visible outside that
+  // module) so the Orders tab can tell whether procurement still needs to run
+  // an RFP for this order before treating it as Blanket in the badge below.
+  const isOrderNoRfpNeeded = useCallback((order: CustomerOrder): boolean => {
+    const procComponents = (order.items || []).flatMap(it => it.components || []).filter(c => c.source === 'PROCUREMENT');
+    if (procComponents.length > 0 && procComponents.every(c => c.noRfpNeeded === false)) return false;
+    const isOutsourcing = (order.items || []).some(i => i.productionType === 'OUTSOURCING');
+    if (isOutsourcing) return true;
+    return (order.items || []).some(i => Boolean(i.costSheetFile || i.costSheetText));
+  }, []);
+
   // The order's most recently uploaded outsourcing cost sheet ("last month's" sheet):
   // the latest entry in an item's costSheets history, falling back to the item's
   // current attached file when no history array has been recorded yet.
@@ -2445,6 +2457,10 @@ const FinanceModuleInner: React.FC<FinanceModuleProps> = ({ config, refreshKey, 
             ) : filteredOrders.map((o, orderIdx) => {
               const pl = (o as any).pl;
               const isBlanketOrder = !!(o.blanketOrder || o.contractId || o.blanketContractId);
+              // The Blanket badge additionally requires "No RFP Needed" in Procurement —
+              // an order linked to a blanket contract still shows as Non-Blanket while
+              // procurement hasn't cleared it off the RFP requirement.
+              const showBlanketBadge = isBlanketOrder && isOrderNoRfpNeeded(o);
               const isBreach = !isBlanketOrder && isMarginBreach(pl.costInOrderCurrency ?? pl.cost, pl.markupPct, config.settings.minimumMarginPct);
               const currentTab = activeTab as string;
               const showRow = currentTab === 'orders' ||
@@ -2503,12 +2519,15 @@ const FinanceModuleInner: React.FC<FinanceModuleProps> = ({ config, refreshKey, 
                                 </span>
                               );
                             })()}
-                            {isBlanketOrder ? (
+                            {showBlanketBadge ? (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-teal-50 text-teal-700 border border-teal-200 text-[9px] font-black uppercase tracking-tight shadow-xs whitespace-nowrap shrink-0" title="Blanket Contract Order">
                                 <i className="fa-solid fa-layer-group text-[8px]"></i> Blanket
                               </span>
                             ) : (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 text-slate-500 border border-slate-200 text-[9px] font-bold uppercase tracking-tight whitespace-nowrap shrink-0" title="Standard Order">
+                              <span
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 text-slate-500 border border-slate-200 text-[9px] font-bold uppercase tracking-tight whitespace-nowrap shrink-0"
+                                title={isBlanketOrder ? 'Linked to a blanket contract, but Procurement has not marked this order as No RFP Needed' : 'Standard Order'}
+                              >
                                 Non-Blanket
                               </span>
                             )}
