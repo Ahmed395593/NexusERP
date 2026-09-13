@@ -54,7 +54,7 @@ const OrderStatus = {
     FULFILLED: 'FULFILLED'
 };
 
-const evaluateMarginStatus = (items, minMargin, currentStatus) => {
+const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 1, isBlanketOrder = false) => {
     let totalRevenue = 0;
     let totalCost = 0;
     let hasComponents = false;
@@ -71,13 +71,24 @@ const evaluateMarginStatus = (items, minMargin, currentStatus) => {
         }
     });
 
-    const marginAmt = totalRevenue - totalCost;
-    const markupPct = totalCost > 0 ? (marginAmt / totalCost) * 100 : (totalRevenue > 0 ? 100 : 0);
-
     // Safeguard: Don't auto-transition terminal or manual statuses
     if ([OrderStatus.REJECTED, OrderStatus.IN_HOLD].includes(currentStatus)) return currentStatus;
 
-    // Priority 1: Margin Protection (if components present)
+    // BLANKET ORDER EXEMPTION: Blanket orders skip all margin/status auto-transitions
+    if (isBlanketOrder) {
+        if ((hasComponents || anyAccepted) && currentStatus === OrderStatus.LOGGED) {
+            return OrderStatus.TECHNICAL_REVIEW;
+        }
+        if (currentStatus === OrderStatus.NEGATIVE_MARGIN) {
+            return (hasComponents || anyAccepted) ? OrderStatus.TECHNICAL_REVIEW : OrderStatus.LOGGED;
+        }
+        return currentStatus;
+    }
+
+    const marginAmt = totalRevenue - totalCost;
+    const markupPct = totalCost > 0 ? (marginAmt / totalCost) * 100 : (totalRevenue > 0 ? 100 : 0);
+
+    // Priority 1: Margin Protection (if components present and not blanket order)
     if (hasComponents && markupPct < minMargin) return OrderStatus.NEGATIVE_MARGIN;
 
     // Priority 2: Technical Workflow Transition
@@ -800,6 +811,32 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'dist')));
 
+const getTechReviewStartTime = (order) => {
+    if (!order) return Date.now();
+    if (order.technicalReviewStartedAt) {
+        const t = new Date(order.technicalReviewStartedAt).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    const logs = order.logs || [];
+    for (let i = logs.length - 1; i >= 0; i--) {
+        const l = logs[i];
+        const msg = (l.message || '').toLowerCase();
+        if (l.status === 'LOGGED' || msg.includes('rollback to logged') || msg.includes('order acquisition')) {
+            const t = new Date(l.timestamp).getTime();
+            if (!isNaN(t) && t > 0) return t;
+        }
+    }
+    if (order.dataEntryTimestamp) {
+        const t = new Date(order.dataEntryTimestamp).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    if (order.orderDate) {
+        const t = new Date(order.orderDate).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    return Date.now();
+};
+
 // --- HEALTH CHECK HELPER ---
 const calculateOrderHealth = (order, settings) => {
     let isOverdue = false;
@@ -809,20 +846,23 @@ const calculateOrderHealth = (order, settings) => {
     if (limitKey) {
         const limitHrs = settings[limitKey];
         if (limitHrs > 0) {
-            const logs = order.logs || [];
-            let earliestLog = null;
-            // Iterate backwards to find the start of the current status block
-            for (let i = logs.length - 1; i >= 0; i--) {
-                if (logs[i].status === order.status) {
-                    earliestLog = logs[i];
-                } else {
-                    break;
+            let statusEnteredAt;
+            if (order.status === OrderStatus.TECHNICAL_REVIEW) {
+                statusEnteredAt = getTechReviewStartTime(order);
+            } else {
+                const logs = order.logs || [];
+                let earliestLog = null;
+                // Iterate backwards to find the start of the current status block
+                for (let i = logs.length - 1; i >= 0; i--) {
+                    if (logs[i].status === order.status) {
+                        earliestLog = logs[i];
+                    } else {
+                        break;
+                    }
                 }
+                statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             }
-            const statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             const elapsedHrs = (Date.now() - statusEnteredAt) / (1000 * 60 * 60);
-
-
 
             if (elapsedHrs > limitHrs) isOverdue = true;
         }
@@ -1105,6 +1145,12 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
             case 'rollback-to-logged':
                 const rollbackOld = JSON.parse(JSON.stringify(order));
                 order.status = OrderStatus.LOGGED;
+                // Set or preserve blanketOrder classification
+                if (payload && payload.isBlanket !== undefined) {
+                    order.blanketOrder = Boolean(payload.isBlanket);
+                } else if (order.blanketOrder === undefined) {
+                    order.blanketOrder = Boolean(order.contractId || order.blanketContractId || (order.items && order.items.some(i => i.productionType === 'OUTSOURCING')));
+                }
                 // Clear components and reset item approvals as requested
                 order.items.forEach(item => {
                     item.components = [];

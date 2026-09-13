@@ -89,7 +89,8 @@ export const ProfitabilityReport: React.FC<ProfitabilityReportProps> = ({ orders
       const marginAmt = revenue - costInOrderCurrency;
       const marginPctOnSales = revenue > 0 ? (marginAmt / revenue) * 100 : 0;
       const markupPct = costInOrderCurrency > 0 ? (marginAmt / costInOrderCurrency) * 100 : (revenue > 0 ? 100 : 0);
-      const isBelowThreshold = isMarginBreach(costInOrderCurrency, markupPct, config.settings.minimumMarginPct);
+      const isOrderBlanket = !!(order.blanketOrder || order.contractId || order.blanketContractId);
+      const isBelowThreshold = !isOrderBlanket && isMarginBreach(costInOrderCurrency, markupPct, config.settings.minimumMarginPct);
       return { id: order.id, internalOrderNumber: order.internalOrderNumber, customerName: order.customerName, status: order.status, revenue, cost, costInOrderCurrency, conversionRate: rate, currency: getOrderCurrency(order), marginAmt, marginPctOnSales, markupPct, hasPendingCosts, isBelowThreshold, _originalOrder: order };
     });
   };

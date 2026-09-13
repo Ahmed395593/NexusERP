@@ -300,16 +300,6 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
     let hasActiveTechReview = false;
     let anyAccepted = false;
 
-    // BLANKET ORDER EXEMPTION: Blanket orders skip all margin/status auto-transitions.
-    // They are allowed to proceed through procurement and delivery without margin checks.
-    if (isBlanketOrder) {
-        // Blanket orders still allow tech review transition if items are accepted
-        if ((anyAccepted) && currentStatus === OrderStatus.LOGGED) {
-            return OrderStatus.TECHNICAL_REVIEW;
-        }
-        return currentStatus;
-    }
-
     (items || []).forEach(it => {
         totalRevenue += ((getItemEffectiveQty(it) || 0) * (it.pricePerUnit || 0));
         if (it.isAccepted) anyAccepted = true;
@@ -325,12 +315,28 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
                 if (isModified) hasActiveTechReview = true;
             }
 
-
             it.components.forEach(c => {
                 totalCost += ((c.quantity || 0) * (c.unitCost || 0));
             });
         }
     });
+
+    // Safeguard: Don't auto-transition terminal or manual statuses
+    if ([OrderStatus.REJECTED, OrderStatus.IN_HOLD].includes(currentStatus)) return currentStatus;
+
+    // BLANKET ORDER EXEMPTION: Blanket orders skip all margin/status auto-transitions.
+    // They are allowed to proceed through procurement and delivery without margin checks.
+    if (isBlanketOrder) {
+        // Blanket orders still allow tech review transition if at least one item is accepted or in active tech review
+        if ((hasActiveTechReview || anyAccepted) && currentStatus === OrderStatus.LOGGED) {
+            return OrderStatus.TECHNICAL_REVIEW;
+        }
+        // If a blanket order somehow had NEGATIVE_MARGIN (e.g. legacy data), auto-recover it!
+        if (currentStatus === OrderStatus.NEGATIVE_MARGIN) {
+            return (hasActiveTechReview || anyAccepted) ? OrderStatus.TECHNICAL_REVIEW : OrderStatus.LOGGED;
+        }
+        return currentStatus;
+    }
 
     // Multi-currency amendment: when the order is denominated in a non-L.E.
     // currency, the cost side (PO currency) is brought into the order's revenue
@@ -342,11 +348,8 @@ const evaluateMarginStatus = (items, minMargin, currentStatus, conversionRate = 
     const marginAmt = totalRevenue - totalCostInOrderCurrency;
     const markupPct = totalCostInOrderCurrency > 0 ? (marginAmt / totalCostInOrderCurrency) * 100 : (totalRevenue > 0 ? 100 : 0);
 
-    // Safeguard: Don't auto-transition terminal or manual statuses
-    if ([OrderStatus.REJECTED, OrderStatus.IN_HOLD].includes(currentStatus)) return currentStatus;
-
-    // Priority 1: Margin Protection (only when costs have been identified)
-    if (hasComponents && isMarginBreach(totalCostInOrderCurrency, markupPct, minMargin)) return OrderStatus.NEGATIVE_MARGIN;
+    // Priority 1: Margin Protection (only when costs have been identified, exempting blanket orders)
+    if (hasComponents && isMarginBreach(totalCostInOrderCurrency, markupPct, minMargin, isBlanketOrder)) return OrderStatus.NEGATIVE_MARGIN;
 
     // Priority 2: Technical Workflow Transition
     if ((hasActiveTechReview || anyAccepted) && currentStatus === OrderStatus.LOGGED) {
@@ -380,6 +383,8 @@ const canIssuePoForOrder = (order, minMargin) => {
     }
 
     if (order.customerName === 'Internal Stock') return true;
+    // Blanket orders are exempt from margin protection checks for PO issuance
+    if (order.blanketOrder || order.contractId || order.blanketContractId) return true;
 
     let totalRevenue = 0;
     let totalCost = 0;
@@ -1181,12 +1186,23 @@ const createAuditLog = (message, status, user) => ({
 });
 
 // One-time repair: orders that were incorrectly blocked as NEGATIVE_MARGIN when no
-// costs had been identified are reset to LOGGED on server start.
-const repairNegativeMarginOrders = (db) => {
+// costs had been identified or when classified as blanket orders are reset.
+const repairNegativeMarginOrders = (db, targetPath = DB_PATH) => {
     if (!db.orders || db.orders.length === 0) return;
     let changed = false;
     db.orders.forEach(order => {
         if (order.status !== OrderStatus.NEGATIVE_MARGIN) return;
+        const isBlanket = Boolean(order.blanketOrder || order.contractId || order.blanketContractId);
+        if (isBlanket) {
+            const hasComponents = (order.items || []).some(i => i.components && i.components.length > 0);
+            const anyAccepted = (order.items || []).some(i => i.isAccepted);
+            order.status = (hasComponents || anyAccepted) ? OrderStatus.TECHNICAL_REVIEW : OrderStatus.LOGGED;
+            order.loggingComplianceViolation = false;
+            if (!order.logs) order.logs = [];
+            order.logs.push(createAuditLog(`[AUTO] Data repair: Blanket order exempt from NEGATIVE_MARGIN restored to ${order.status}`, order.status, 'System'));
+            changed = true;
+            return;
+        }
         const totalCost = (order.items || []).reduce((sum, item) =>
             sum + (item.components || []).reduce((cSum, c) =>
                 cSum + ((c.quantity || 0) * (c.unitCost || 0)), 0), 0);
@@ -1220,10 +1236,11 @@ const reconcileOrdersMarginOnThresholdChange = (db, oldMinMargin, newMinMargin, 
         const oldStatus = order.status;
         let nextStatus = oldStatus || OrderStatus.LOGGED;
 
+        const isBlanket = Boolean(order.blanketOrder || order.contractId || order.blanketContractId);
         if (order.customerName !== 'Internal Stock') {
-            nextStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            nextStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, isBlanket);
         } else {
-            const calculatedStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            const calculatedStatus = evaluateMarginStatus(order.items, newMinMargin, oldStatus || OrderStatus.LOGGED, order.conversionRate, isBlanket);
             if (calculatedStatus === OrderStatus.NEGATIVE_MARGIN) {
                 const hasComponents = (order.items || []).some(i => i.components && i.components.length > 0);
                 if (hasComponents && oldStatus === OrderStatus.LOGGED) {
@@ -1364,10 +1381,37 @@ const handleStockReceipts = (oldOrder, newOrder, db) => {
     });
 };
 
+const getTechReviewStartTime = (order) => {
+    if (!order) return Date.now();
+    if (order.technicalReviewStartedAt) {
+        const t = new Date(order.technicalReviewStartedAt).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    const logs = order.logs || [];
+    for (let i = logs.length - 1; i >= 0; i--) {
+        const l = logs[i];
+        const msg = (l.message || '').toLowerCase();
+        if (l.status === 'LOGGED' || msg.includes('rollback to logged') || msg.includes('order acquisition')) {
+            const t = new Date(l.timestamp).getTime();
+            if (!isNaN(t) && t > 0) return t;
+        }
+    }
+    if (order.dataEntryTimestamp) {
+        const t = new Date(order.dataEntryTimestamp).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    if (order.orderDate) {
+        const t = new Date(order.orderDate).getTime();
+        if (!isNaN(t) && t > 0) return t;
+    }
+    return Date.now();
+};
+
 const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipStatusEval = false) => {
     // 1. Ensure basic structures
     if (!order.logs) order.logs = [];
     if (!order.items) order.items = [];
+    if (!order.status) order.status = OrderStatus.LOGGED;
 
     // 1b. Multi-currency defaults — every order is implicitly denominated in
     //     'L.E.' with conversionRate = 1 unless explicitly set. This mirrors
@@ -1381,6 +1425,7 @@ const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipSta
     if (isNew) {
         if (!order.internalOrderNumber) order.internalOrderNumber = generateInternalOrderNumber(db);
         if (!order.dataEntryTimestamp) order.dataEntryTimestamp = new Date().toISOString();
+        if (!order.technicalReviewStartedAt) order.technicalReviewStartedAt = order.dataEntryTimestamp;
         if (order.logs.length === 0) {
             order.logs.push(createAuditLog('Order acquisition recorded', OrderStatus.LOGGED, user));
         }
@@ -1520,14 +1565,15 @@ const processedOrderInternal = (order, db, user, isNew, oldOrder = null, skipSta
 
         // Skip margin check for Internal Stock orders (they always have 0 revenue)
         let nextStatus = order.status || OrderStatus.LOGGED;
+        const isBlanket = Boolean(order.blanketOrder || order.contractId || order.blanketContractId);
         if (order.customerName !== 'Internal Stock') {
-            nextStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            nextStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, isBlanket);
         } else {
             // For Internal Stock, standard transitions apply (e.g. LOGGED -> TECH REVIEW if components exist)
             // We reuse evaluateMarginStatus logic BUT purely for workflow transitions, ignoring negative margin return
             // Actually, evaluateMarginStatus prioritizes margin check. Let's replicate strict workflow logic here or modify evaluateMarginStatus.
             // Simpler: Just allow negative margin if it's internal stock.
-            const calculatedStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, order.blanketOrder);
+            const calculatedStatus = evaluateMarginStatus(order.items, minMargin, order.status || OrderStatus.LOGGED, order.conversionRate, isBlanket);
             if (calculatedStatus === OrderStatus.NEGATIVE_MARGIN) {
                 // Fallback: If it blocked on margin, check if it should proceed to Tech Review
                 const hasComponents = (order.items || []).some(i => i.components && i.components.length > 0);
@@ -1933,8 +1979,8 @@ const runThresholdAudit = async () => {
                 `Order ${order.internalOrderNumber} has been placed ON HOLD. Customer: ${order.customerName}.`);
         }
 
-        // A4. Negative Margin (status-based, not time-based)
-        if (order.status === 'NEGATIVE_MARGIN') {
+        // A4. Negative Margin (status-based, not time-based - exempting blanket orders)
+        if (order.status === 'NEGATIVE_MARGIN' && !order.blanketOrder && !order.contractId && !order.blanketContractId) {
             let totalRevenue = 0, totalCost = 0;
             (order.items || []).forEach(it => {
                 totalRevenue += (getItemEffectiveQty(it) * it.pricePerUnit);
@@ -1997,8 +2043,13 @@ const runThresholdAudit = async () => {
             const limitHrs = settings[thresholdKey];
             const groupIds = settings.thresholdNotifications?.[thresholdKey] || [];
             if (limitHrs > 0 && groupIds.length > 0) {
-                const lastStatusLog = [...(order.logs || [])].reverse().find(l => l.status === order.status);
-                const statusEnteredAt = lastStatusLog ? new Date(lastStatusLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
+                let statusEnteredAt;
+                if (order.status === OrderStatus.TECHNICAL_REVIEW) {
+                    statusEnteredAt = getTechReviewStartTime(order);
+                } else {
+                    const lastStatusLog = [...(order.logs || [])].reverse().find(l => l.status === order.status);
+                    statusEnteredAt = lastStatusLog ? new Date(lastStatusLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
+                }
                 const elapsedHrs = (Date.now() - statusEnteredAt) / (1000 * 60 * 60);
                 if (elapsedHrs > limitHrs) {
                     const label = THRESHOLD_LABELS[thresholdKey] || thresholdKey;
@@ -2223,17 +2274,22 @@ const calculateOrderHealth = (order, settings) => {
     if (limitKey) {
         const limitHrs = settings[limitKey];
         if (limitHrs > 0) {
-            const logs = order.logs || [];
-            let earliestLog = null;
-            // Iterate backwards to find the start of the current status block
-            for (let i = logs.length - 1; i >= 0; i--) {
-                if (logs[i].status === order.status) {
-                    earliestLog = logs[i];
-                } else {
-                    break;
+            let statusEnteredAt;
+            if (order.status === OrderStatus.TECHNICAL_REVIEW) {
+                statusEnteredAt = getTechReviewStartTime(order);
+            } else {
+                const logs = order.logs || [];
+                let earliestLog = null;
+                // Iterate backwards to find the start of the current status block
+                for (let i = logs.length - 1; i >= 0; i--) {
+                    if (logs[i].status === order.status) {
+                        earliestLog = logs[i];
+                    } else {
+                        break;
+                    }
                 }
+                statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             }
-            const statusEnteredAt = earliestLog ? new Date(earliestLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
             const elapsedHrs = (Date.now() - statusEnteredAt) / (1000 * 60 * 60);
 
 
@@ -2268,10 +2324,63 @@ const calculateOrderHealth = (order, settings) => {
     return { ...order, isOverdue };
 };
 
+// --- CUSTOMER WALLET HELPER ---
+// Calculates customer wallet balances (per-project and aggregate total).
+// Blanket orders where the customer has not been invoiced or has not paid yet
+// generate a negative wallet balance (debt: paid - commitment) until paid/settled.
+const computeCustomerWallet = (customer, orders = []) => {
+    if (!customer) return customer;
+    const projectBalances = { ...(customer.walletBalances || {}) };
+
+    // Active blanket orders for this customer (not rejected)
+    const custBlanketOrders = orders.filter(o => 
+        o.customerName === customer.name && 
+        Boolean(o.blanketOrder || o.contractId || o.blanketContractId) &&
+        o.status !== OrderStatus.REJECTED
+    );
+
+    custBlanketOrders.forEach(o => {
+        // If the blanket order is fulfilled/settled, its settlement difference is already in projectBalances
+        if (o.status === OrderStatus.FULFILLED) return;
+
+        let orderGross = 0;
+        let orderCost = 0;
+        (o.items || []).forEach(it => {
+            orderGross += (getItemEffectiveQty(it) || 0) * (it.pricePerUnit || 0) * (1 + ((it.taxPercent || 0) / 100));
+            (it.components || []).forEach(c => {
+                orderCost += (c.quantity || 0) * (c.unitCost || 0);
+            });
+        });
+        if (o.appliesWithholdingTax) orderGross *= 0.99;
+
+        const paid = (o.payments || []).reduce((s, p) => s + (p.amount || 0), 0);
+        const commitment = orderGross > 0 ? orderGross : orderCost;
+
+        // When not invoiced or not fully paid, customer owes the unpaid amount (negative wallet / debt)
+        if (commitment > 0) {
+            const balanceDelta = paid - commitment; // Negative if paid < commitment (debt)
+            const projectKey = String((o.projectName || '').trim()) || '(No Project)';
+            projectBalances[projectKey] = (projectBalances[projectKey] || 0) + balanceDelta;
+        }
+    });
+
+    const totalBalance = Object.values(projectBalances).reduce((sum, val) => sum + (Number(val) || 0), 0);
+    return {
+        ...customer,
+        walletBalance: Math.round(totalBalance * 100) / 100,
+        walletBalances: projectBalances
+    };
+};
+
 // --- GENERIC CRUD ---
 const getCollection = (col) => (req, res) => {
     const db = getDb(req);
     if (col === 'users') return res.json((db[col] || []).map(({ password, ...u }) => u));
+
+    if (col === 'customers') {
+        const orders = db.orders || [];
+        return res.json((db[col] || []).map(c => computeCustomerWallet(c, orders)));
+    }
 
     if (col === 'orders') {
         const settings = resolveSettings(db, isSandbox(req));
@@ -2316,6 +2425,9 @@ const getItemFromCollection = (col) => (req, res) => {
     if (col === 'users') {
         const { password, ...safe } = item;
         return res.json(safe);
+    }
+    if (col === 'customers') {
+        return res.json(computeCustomerWallet(item, db.orders || []));
     }
     if (col === 'orders') {
         const settings = resolveSettings(db, isSandbox(req));
@@ -2879,6 +2991,7 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                     order.status = OrderStatus.WAITING_SUPPLIERS;
                 }
 
+                order.technicalReviewFinishedAt = new Date().toISOString();
                 order.logs.push(createAuditLog('Technical study finalized and pushed to Procurement', order.status, user));
                 break;
 
@@ -2891,10 +3004,19 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 order.dataEntryTimestamp = nowIso;
                 order.orderDate = todayDate;
                 order.statusUpdatedAt = nowIso;
+                order.technicalReviewStartedAt = nowIso;
+                delete order.technicalReviewFinishedAt;
                 order.loggingComplianceViolation = false;
                 delete order.statusEnteredAt;
                 delete order.lastStatusChange;
                 delete order.statusBeforeHold;
+
+                // Set or preserve blanketOrder classification
+                if (payload && payload.isBlanket !== undefined) {
+                    order.blanketOrder = Boolean(payload.isBlanket);
+                } else if (order.blanketOrder === undefined) {
+                    order.blanketOrder = Boolean(order.contractId || order.blanketContractId || (order.items && order.items.some(i => i.productionType === 'OUTSOURCING')));
+                }
 
                 // Clear all components added in technical review & reset item approvals
                 order.items.forEach(item => {
@@ -2929,7 +3051,8 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 delete order.noRfpNeeded;
 
                 reconcileInventory(rollbackOld, order, db);
-                order.logs.push(createAuditLog(`Rollback to Logged: SLA reset from scratch, BoM components and cost sheets cleared. Reason: ${payload?.reason || 'Manual rollback'}`, order.status, user));
+                const orderTypeDesc = order.blanketOrder ? 'Blanket Order' : 'Standard Order';
+                order.logs.push(createAuditLog(`Rollback to Logged (${orderTypeDesc}): SLA reset from scratch, BoM components and cost sheets cleared. Reason: ${payload?.reason || 'Manual rollback'}`, order.status, user));
 
                 // Notification for Rollback
                 if (settings && settings.enableRollbackAlerts) {
@@ -3036,6 +3159,9 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 order.customerReferenceNumber = `rej_${today}_${oldCustRef}`;
                 
                 order.status = OrderStatus.REJECTED;
+                if (!order.technicalReviewFinishedAt && [OrderStatus.LOGGED, OrderStatus.TECHNICAL_REVIEW, OrderStatus.NEGATIVE_MARGIN].includes(oldStatus)) {
+                    order.technicalReviewFinishedAt = new Date().toISOString();
+                }
                 // Release any reserved inventory back to free stock
                 order.items.forEach(item => {
                     (item.components || []).forEach(comp => {
@@ -3053,7 +3179,13 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 if (taItemIdx === -1) throw new Error("Item not found");
                 const taItem = order.items[taItemIdx];
                 taItem.isAccepted = !taItem.isAccepted;
-                order.logs.push(createAuditLog(`Item ${taItem.orderNumber}: ${taItem.isAccepted ? 'Accepted' : 'Acceptance Revoked'}`, order.status, user));
+
+                const hasAnyAccepted = order.items.some(i => i.isAccepted);
+                if (hasAnyAccepted && order.status === OrderStatus.LOGGED) {
+                    order.status = OrderStatus.TECHNICAL_REVIEW;
+                }
+
+                order.logs.push(createAuditLog(`Item ${taItem.orderNumber || (taItemIdx + 1)}: ${taItem.isAccepted ? 'Accepted' : 'Acceptance Revoked'}`, order.status, user));
                 break;
             }
 
@@ -3184,6 +3316,55 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 break;
             }
 
+            case 'delete-cost-sheet-record': {
+                const dcsItemIdx = order.items.findIndex(i => i.id === payload.itemId);
+                if (dcsItemIdx === -1) throw new Error("Item not found");
+                const dcsItem = order.items[dcsItemIdx];
+
+                if (!dcsItem.costSheets || dcsItem.costSheets.length <= 1) {
+                    throw new Error("Cannot delete the only cost sheet record — at least one must remain.");
+                }
+
+                const recIdx = dcsItem.costSheets.findIndex(r => r.id === payload.recordId);
+                if (recIdx === -1) throw new Error("Cost sheet record not found");
+
+                const deletedRec = dcsItem.costSheets[recIdx];
+                dcsItem.costSheets.splice(recIdx, 1);
+
+                // Promote the new last record as the active sheet
+                const newLatest = dcsItem.costSheets[dcsItem.costSheets.length - 1];
+                dcsItem.costSheetFile = newLatest.fileData || undefined;
+                dcsItem.costSheetFileName = newLatest.fileName || undefined;
+
+                // Re-extract metrics from the newly active sheet
+                let newMetrics = { resourceCount: 0, realCost: 0, invoiceTotal: 0 };
+                if (newLatest.fileData) {
+                    try {
+                        newMetrics = extractCostSheetMetrics(newLatest.fileData);
+                    } catch (err) {
+                        console.error("[CostSheet] Failed to extract metrics after delete:", err);
+                    }
+                }
+
+                dcsItem.workingResourceCount = newMetrics.resourceCount || newLatest.workingResourceCount || 0;
+                dcsItem.realCost = newMetrics.realCost || newLatest.realCost || 0;
+                dcsItem.invoiceTotal = newMetrics.invoiceTotal || newLatest.invoiceTotal || 0;
+
+                // Sync to components
+                (dcsItem.components || []).forEach(comp => {
+                    comp.workingResourceCount = dcsItem.workingResourceCount;
+                    comp.realCost = dcsItem.realCost;
+                    comp.invoiceTotal = dcsItem.invoiceTotal;
+                    if (newMetrics.realCost > 0) comp.unitCost = newMetrics.realCost;
+                });
+
+                order.logs.push(createAuditLog(
+                    `Item ${dcsItem.orderNumber || dcsItemIdx + 1}: Cost sheet record deleted (${deletedRec.fileName}, uploaded ${new Date(deletedRec.uploadedAt).toLocaleDateString()}). Reverted to: ${newLatest.fileName}.`,
+                    order.status,
+                    user
+                ));
+                break;
+            }
 
             case 'receive-component': {
                 const itemIdx = order.items.findIndex(i => i.id === payload.itemId);
@@ -4126,20 +4307,25 @@ app.post('/api/v1/orders/:id/dispatch-action', async (req, res) => {
                 if (customer) {
                     if (!customer.walletBalance) customer.walletBalance = 0;
                     
-                    // If totalDifference < 0: customer paid less, they owe nothing more (order was cheaper)
-                    // If totalDifference > 0: customer paid more, credit their wallet
-                    // If totalDifference = 0: exactly matched, no adjustment needed
-                    if (totalDifference < 0) {
-                        // Order was cheaper - no credit needed, mark as settled
-                        order.logs.push(createAuditLog(`Blanket order settled: Settling order ${settlingOrder.internalOrderNumber} was ${Math.abs(totalDifference).toLocaleString()} ${order.currency} less than original. No wallet credit needed.`, order.status, user));
-                    } else if (totalDifference > 0) {
-                        // Customer overpaid - credit wallet (per-project)
-                        const projectKey = String((order.projectName || settlingOrder.projectName || '').trim()) || '(No Project)';
-                        customer.walletBalance = (customer.walletBalance || 0) + totalDifference; // aggregate
-                        customer.walletBalances = customer.walletBalances || {};
-                        customer.walletBalances[projectKey] = (customer.walletBalances[projectKey] || 0) + totalDifference;
-                        order.logs.push(createAuditLog(`Blanket order settled: ${totalDifference.toLocaleString()} ${order.currency} credited to customer wallet for project "${projectKey}" (new balance: ${customer.walletBalance.toLocaleString()} ${order.currency}). Settling order: ${settlingOrder.internalOrderNumber}`, order.status, user));
-                        settlingOrder.logs.push(createAuditLog(`Settlement completed: ${totalDifference.toLocaleString()} ${order.currency} wallet credit applied from blanket order ${order.internalOrderNumber}`, settlingOrder.status, user));
+                    // walletAdjustment = originalTotal - settlingTotal (-totalDifference)
+                    // If totalDifference < 0 (settling was cheaper): customer has CREDIT (walletAdjustment > 0)
+                    // If totalDifference > 0 (settling was more expensive): customer owes DEBT (walletAdjustment < 0)
+                    // If totalDifference = 0: exact match
+                    const walletAdjustment = -totalDifference;
+                    const projectKey = String((order.projectName || settlingOrder.projectName || '').trim()) || '(No Project)';
+                    customer.walletBalances = customer.walletBalances || {};
+                    customer.walletBalances[projectKey] = (customer.walletBalances[projectKey] || 0) + walletAdjustment;
+                    customer.walletBalance = (customer.walletBalance || 0) + walletAdjustment;
+
+                    if (walletAdjustment > 0) {
+                        // Order was cheaper - credit customer wallet
+                        order.logs.push(createAuditLog(`Blanket order settled: Settling order ${settlingOrder.internalOrderNumber} was ${walletAdjustment.toLocaleString()} ${order.currency} less than original. Credited to customer wallet for project "${projectKey}" (new balance: ${customer.walletBalance.toLocaleString()} ${order.currency}).`, order.status, user));
+                        settlingOrder.logs.push(createAuditLog(`Settlement completed: ${walletAdjustment.toLocaleString()} ${order.currency} wallet credit applied from blanket order ${order.internalOrderNumber}`, settlingOrder.status, user));
+                    } else if (walletAdjustment < 0) {
+                        // Settling order cost more - debit customer wallet (unpaid debt)
+                        const debtAmt = Math.abs(walletAdjustment);
+                        order.logs.push(createAuditLog(`Blanket order settled: Settling order ${settlingOrder.internalOrderNumber} was ${debtAmt.toLocaleString()} ${order.currency} more than original. Debited from customer wallet for project "${projectKey}" as unpaid debt (new balance: ${customer.walletBalance.toLocaleString()} ${order.currency}).`, order.status, user));
+                        settlingOrder.logs.push(createAuditLog(`Settlement completed: ${debtAmt.toLocaleString()} ${order.currency} debt recorded to customer wallet from blanket order ${order.internalOrderNumber}`, settlingOrder.status, user));
                     } else {
                         order.logs.push(createAuditLog(`Blanket order settled: Exact match with ${settlingOrder.internalOrderNumber}. No wallet adjustment needed.`, order.status, user));
                     }

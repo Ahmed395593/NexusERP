@@ -1184,8 +1184,18 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const [pendingResolutions, setPendingResolutions] = useState<InTransitCompRecord[] | null>(null);
   const [resolutionChoices, setResolutionChoices] = useState<Record<string, CompResolution>>({});
   const [pendingRollbackOrder, setPendingRollbackOrder] = useState<CustomerOrder | null>(null);
+  const [rollbackIsBlanket, setRollbackIsBlanket] = useState<boolean>(false);
   const [allOrders, setAllOrders] = useState<CustomerOrder[]>([]);
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' }>({ key: 'orderDate', direction: 'asc' });
+
+  const isOrderBlanketType = (order: CustomerOrder): boolean => {
+    return Boolean(
+      order.blanketOrder ||
+      order.contractId ||
+      order.blanketContractId ||
+      (order.items && order.items.some(i => i.productionType === 'OUTSOURCING'))
+    );
+  };
 
 
   useEffect(() => { fetchData(); }, [refreshKey]);
@@ -1703,7 +1713,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
           setPendingRollbackOrder(null);
         }
 
-        await dataService.rollbackOrderToLogged(order.id, resetReason);
+        await dataService.rollbackOrderToLogged(order.id, resetReason, rollbackIsBlanket);
         setNoRfpOverrides(prev => {
           const next = { ...prev };
           delete next[order.id];
@@ -1884,6 +1894,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
     setReviveDuration('');
     setReviveEndDate('');
     setReviveMode('EXTENSION');
+    setRollbackIsBlanket(false);
   };
 
   const handleReplacementSubmit = async () => {
@@ -2168,6 +2179,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
       setPendingRollbackOrder(order);
     } else {
       // No in-transit components, go straight to rollback reason
+      setRollbackIsBlanket(isOrderBlanketType(order) || activeTab === 'outsourcing');
       setActiveAction({ type: 'ORDER_ROLLBACK', order });
     }
   };
@@ -2176,6 +2188,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
   const handleConfirmResolutions = () => {
     if (!pendingRollbackOrder) return;
     // Move to the rollback reason dialog with order context
+    setRollbackIsBlanket(isOrderBlanketType(pendingRollbackOrder) || activeTab === 'outsourcing');
     setActiveAction({ type: 'ORDER_ROLLBACK', order: pendingRollbackOrder });
   };
 
@@ -2841,7 +2854,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                 PO: <span className="text-slate-900 font-black">{o.customerReferenceNumber}</span>
                               </span>
                             )}
-                            {o.blanketOrder ? (
+                            {isOrderBlanketType(o) ? (
                               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-teal-50 text-teal-700 border border-teal-200 text-[9px] font-black uppercase tracking-tight shadow-xs whitespace-nowrap shrink-0" title="Blanket Contract Order">
                                 <i className="fa-solid fa-layer-group text-[8px]"></i> Blanket
                               </span>
@@ -3046,41 +3059,100 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                               </span>
                             </label>
 
+
                             {/* Sheet History Chips */}
-                            {targetItem?.costSheets && targetItem.costSheets.length > 1 && (
-                              <div className="flex items-center gap-1.5 text-[8px] font-bold text-slate-500 bg-slate-50 px-2 py-1 rounded-lg border border-slate-200">
-                                <span className="font-black text-slate-600 flex items-center gap-1">
-                                  <i className="fa-solid fa-clock-rotate-left text-slate-400"></i>
-                                  {t('procurement.outsourcingCard.sheetHistory') || 'History'}:
-                                </span>
-                                {targetItem.costSheets.map((rec, rIdx) => (
-                                  <button
-                                    key={rec.id || rIdx}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      if (rec.fileData) {
-                                        const link = document.createElement('a');
-                                        link.href = rec.fileData;
-                                        link.download = rec.fileName;
-                                        document.body.appendChild(link);
-                                        link.click();
-                                        document.body.removeChild(link);
-                                      }
-                                    }}
-                                    className="px-1.5 py-0.5 bg-white border border-slate-200 hover:border-purple-300 rounded text-purple-700 font-mono text-[8px] hover:bg-purple-50 transition-colors"
-                                    title={`Uploaded: ${new Date(rec.uploadedAt).toLocaleDateString()} - ${rec.workingResourceCount || 0} resources, ${rec.realCost || 0} LE`}
-                                  >
-                                    {rec.fileName} ({new Date(rec.uploadedAt).toLocaleDateString('en-US', { month: 'short' })})
-                                  </button>
-                                ))}
-                              </div>
-                            )}
+                            {targetItem?.costSheets && targetItem.costSheets.length >= 1 && (() => {
+                              const sheets = targetItem.costSheets!;
+                              const latestIdx = sheets.length - 1;
+                              const isOnlySheet = sheets.length === 1;
+                              return (
+                                <div className="flex flex-col gap-1.5 bg-slate-50 px-2.5 py-2 rounded-xl border border-slate-200">
+                                  <span className="font-black text-[8px] text-slate-500 flex items-center gap-1.5 uppercase tracking-wider">
+                                    <i className="fa-solid fa-clock-rotate-left text-slate-400"></i>
+                                    {t('procurement.outsourcingCard.sheetHistory') || 'Cost Sheet History'}
+                                  </span>
+                                  <div className="flex items-start gap-1.5 flex-wrap">
+                                    {sheets.map((rec, rIdx) => {
+                                      const isLatest = rIdx === latestIdx;
+                                      return (
+                                        <div key={rec.id || rIdx} className="flex flex-col items-center gap-0.5">
+                                          {isLatest && (
+                                            <span className="text-[7px] font-black uppercase tracking-wider text-emerald-600 leading-none px-1">
+                                              ★ Latest
+                                            </span>
+                                          )}
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              if (!isLatest && rec.fileData) {
+                                                // Older sheets: download only
+                                                const link = document.createElement('a');
+                                                link.href = rec.fileData;
+                                                link.download = rec.fileName;
+                                                document.body.appendChild(link);
+                                                link.click();
+                                                document.body.removeChild(link);
+                                              } else if (isLatest && rec.fileData) {
+                                                // Latest sheet: download too (view is via the View Sheet button)
+                                                const link = document.createElement('a');
+                                                link.href = rec.fileData;
+                                                link.download = rec.fileName;
+                                                document.body.appendChild(link);
+                                                link.click();
+                                                document.body.removeChild(link);
+                                              }
+                                            }}
+                                            className={`px-2 py-1 rounded-lg font-mono text-[8px] transition-colors flex items-center gap-1 ${
+                                              isLatest
+                                                ? 'bg-emerald-50 border-2 border-emerald-400 text-emerald-800 ring-2 ring-emerald-200 shadow-sm hover:bg-emerald-100'
+                                                : 'bg-white border border-slate-200 hover:border-purple-300 text-purple-700 hover:bg-purple-50'
+                                            }`}
+                                            title={isLatest
+                                              ? `Latest sheet — Uploaded: ${new Date(rec.uploadedAt).toLocaleDateString()} | ${rec.workingResourceCount || 0} resources, ${rec.realCost || 0} LE. Click to download.`
+                                              : `Older version — Uploaded: ${new Date(rec.uploadedAt).toLocaleDateString()} | ${rec.workingResourceCount || 0} resources, ${rec.realCost || 0} LE. Click to download.`
+                                            }
+                                          >
+                                            {isLatest && <i className="fa-solid fa-file-excel text-emerald-600 text-[8px]"></i>}
+                                            {rec.fileName} ({new Date(rec.uploadedAt).toLocaleDateString('en-US', { month: 'short', year: '2-digit' })})
+                                          </button>
+                                          {isLatest && (
+                                            <button
+                                              disabled={isOnlySheet}
+                                              onClick={async (e) => {
+                                                e.stopPropagation();
+                                                if (isOnlySheet) return;
+                                                if (!confirm(`Delete this cost sheet record?\n"${rec.fileName}" (${new Date(rec.uploadedAt).toLocaleDateString()})\n\nThe previous sheet's costs will be restored.`)) return;
+                                                try {
+                                                  await dataService.deleteCostSheetRecord(o.id, targetItem.id, rec.id);
+                                                  await fetchData();
+                                                } catch (err: any) {
+                                                  alert(err.message || 'Failed to delete cost sheet record');
+                                                }
+                                              }}
+                                              className={`px-1.5 py-0.5 rounded text-[7px] font-black uppercase tracking-wider transition-all flex items-center gap-0.5 ${
+                                                isOnlySheet
+                                                  ? 'bg-slate-100 text-slate-300 border border-slate-200 cursor-not-allowed'
+                                                  : 'bg-rose-50 border border-rose-300 text-rose-600 hover:bg-rose-100 hover:text-rose-700 cursor-pointer'
+                                              }`}
+                                              title={isOnlySheet ? 'Cannot delete the only cost sheet — at least one must remain.' : 'Delete this cost sheet record and restore the previous one'}
+                                            >
+                                              <i className="fa-solid fa-trash-can text-[7px]"></i>
+                                              Delete
+                                            </button>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              );
+                            })()}
                           </div>
                         ) : (
                           <>
                             {readyForPo && allOrderProcurementAwarded && (
                               <button
-                                disabled={o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded}
+                                disabled={(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded}
                                 onClick={async (e) => {
                                   e.stopPropagation();
                                   const po = await dataService.getUniquePoNumber();
@@ -3097,7 +3169,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                     setActiveAction({ type: 'PO', order: o, item: sameSupplier[0].item, comp: sameSupplier[0].comp });
                                   }
                                 }}
-                                className={`px-5 py-2.5 rounded-xl text-[10px] font-black uppercase shadow-lg flex items-center gap-2 transition-all ${o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-100'
+                                className={`px-5 py-2.5 rounded-xl text-[10px] font-black uppercase shadow-lg flex items-center gap-2 transition-all ${(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-emerald-100'
                                   }`}
                               >
                                 <i className="fa-solid fa-file-invoice"></i> {t('procurement.po.issuePOAll')}
@@ -3489,7 +3561,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
 
                                         {allOrderProcurementAwarded && (
                                           <button
-                                            disabled={o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded}
+                                            disabled={(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded}
                                             onClick={async () => {
                                               const po = await dataService.getUniquePoNumber();
                                               setPoNumberInput(po);
@@ -3505,7 +3577,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                               setContractStartDate(contractInfo.contractStartDate);
                                               setActiveAction({ type: 'PO', order: o, item: i, comp: c });
                                             }}
-                                            className={`px-4 py-2 rounded-lg text-[9px] font-black uppercase shadow-sm transition-all ${o.status === OrderStatus.NEGATIVE_MARGIN || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed grayscale' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+                                            className={`px-4 py-2 rounded-lg text-[9px] font-black uppercase shadow-sm transition-all ${(o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o)) || !allOrderProcurementAwarded ? 'bg-slate-200 text-slate-400 cursor-not-allowed grayscale' : 'bg-blue-600 text-white hover:bg-blue-700'}`}
                                           >
                                             Issue PO
                                           </button>
@@ -3522,7 +3594,7 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                                           Reset Award
                                         </button>
                                       </div>
-                                      {o.status === OrderStatus.NEGATIVE_MARGIN && (
+                                      {o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanketType(o) && (
                                         <div className="flex items-center gap-1.5 text-[8px] font-black text-rose-500 uppercase animate-pulse">
                                           <i className="fa-solid fa-triangle-exclamation"></i>
                                           {t('procurement.actions.financialBreach')}
@@ -4266,13 +4338,10 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                       </div>
                     )}
 
-                    {(activeAction.type === 'RESET' || activeAction.type === 'ORDER_ROLLBACK') && (
+                    {activeAction.type === 'RESET' && (
                       <div className="p-6 bg-rose-50 rounded-3xl border border-rose-100 space-y-4">
                         <p className="text-sm text-rose-800 font-bold leading-relaxed">
-                          {activeAction.type === 'RESET'
-                            ? 'Warning: This will void current sourcing progress and return the component to "Pending Offer".'
-                            : 'Strategic Action: Reverting this entire order will move it back to the "Logged Registry". This should only be used to correct major entry errors.'
-                          }
+                          {t('procurement.reset.warningReset')}
                         </p>
                         <div className="space-y-1.5">
                           <label className="text-[9px] font-black text-rose-400 uppercase">{t('procurement.reset.mandatoryReason')}</label>
@@ -4281,6 +4350,76 @@ const ProcurementModuleInner: React.FC<ProcurementModuleProps> = ({ config, refr
                             placeholder="e.g. Supplier failed to deliver, pricing expired, correction required..."
                             value={resetReason} onChange={e => setResetReason(e.target.value)}
                           />
+                        </div>
+                      </div>
+                    )}
+
+                    {activeAction.type === 'ORDER_ROLLBACK' && (
+                      <div className="space-y-4">
+                        <div className="p-5 bg-slate-50 rounded-3xl border border-slate-200 space-y-3">
+                          <div className="flex items-center justify-between">
+                            <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                              {t('procurement.rollback.targetClassification') || 'Target Order Classification in Logged Registry'}
+                            </label>
+                            <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-md border ${rollbackIsBlanket ? 'bg-teal-50 text-teal-700 border-teal-200' : 'bg-blue-50 text-blue-700 border-blue-200'}`}>
+                              {rollbackIsBlanket ? t('procurement.rollback.blanketOrder') : t('procurement.rollback.standardOrder')}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <button
+                              type="button"
+                              onClick={() => setRollbackIsBlanket(false)}
+                              className={`p-3.5 rounded-2xl border-2 text-left transition-all flex flex-col gap-1 cursor-pointer ${
+                                !rollbackIsBlanket
+                                  ? 'bg-blue-50/80 border-blue-500 text-blue-900 shadow-sm ring-2 ring-blue-500/20'
+                                  : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-black uppercase tracking-wider flex items-center gap-1.5">
+                                  <i className="fa-solid fa-box text-blue-600"></i> {t('procurement.rollback.standardOrder')}
+                                </span>
+                                {!rollbackIsBlanket && <i className="fa-solid fa-circle-check text-blue-600 text-xs"></i>}
+                              </div>
+                              <span className="text-[9px] font-medium text-slate-500">
+                                {t('procurement.rollback.standardOrderDesc')}
+                              </span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => setRollbackIsBlanket(true)}
+                              className={`p-3.5 rounded-2xl border-2 text-left transition-all flex flex-col gap-1 cursor-pointer ${
+                                rollbackIsBlanket
+                                  ? 'bg-teal-50/80 border-teal-500 text-teal-900 shadow-sm ring-2 ring-teal-500/20'
+                                  : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-black uppercase tracking-wider flex items-center gap-1.5">
+                                  <i className="fa-solid fa-layer-group text-teal-600"></i> {t('procurement.rollback.blanketOrder')}
+                                </span>
+                                {rollbackIsBlanket && <i className="fa-solid fa-circle-check text-teal-600 text-xs"></i>}
+                              </div>
+                              <span className="text-[9px] font-medium text-slate-500">
+                                {t('procurement.rollback.blanketOrderDesc')}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="p-6 bg-rose-50 rounded-3xl border border-rose-100 space-y-4">
+                          <p className="text-xs text-rose-800 font-bold leading-relaxed">
+                            {t('procurement.rollback.warningRollback')}
+                          </p>
+                          <div className="space-y-1.5">
+                            <label className="text-[9px] font-black text-rose-400 uppercase">{t('procurement.reset.mandatoryReason')}</label>
+                            <textarea
+                              className="w-full p-4 bg-white border border-rose-200 rounded-2xl text-sm font-bold outline-none focus:ring-4 focus:ring-rose-100"
+                              placeholder="e.g. Order specifications changed, pricing expired, correction required..."
+                              value={resetReason} onChange={e => setResetReason(e.target.value)}
+                            />
+                          </div>
                         </div>
                       </div>
                     )}

@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { dataService } from '../services/dataService';
 import { CustomerOrder, CustomerOrderItem, InventoryItem, ManufacturingComponent, OrderStatus, Supplier, SupplierPart, AppConfig, CompStatus, User, getItemEffectiveStatus } from '../types';
-import { getItemEffectiveQty, getOrderCurrency, getOrderConversionRate, calculateCatalogMatchScore } from '../utils';
+import { getItemEffectiveQty, getOrderCurrency, getOrderConversionRate, calculateCatalogMatchScore, getTechReviewStartTime } from '../utils';
 import { isMarginBreach } from '../shared/margin';
 import { PartHistory } from './PartHistory';
 
@@ -211,22 +211,27 @@ const calculateContractEndDate = (startDate: string, duration: string): Date | n
 const ThresholdDisplay: React.FC<{ order: CustomerOrder, config: AppConfig }> = ({ order, config }) => {
   const [remaining, setRemaining] = useState<number>(0);
 
+  const limitHrs = config.settings.technicalReviewLimitHrs;
+
   useEffect(() => {
     const calc = () => {
-      const limitHrs = order.status === OrderStatus.LOGGED ? config.settings.orderEditTimeLimitHrs : config.settings.technicalReviewLimitHrs;
-      const lastLog = [...order.logs].reverse().find(l => l.status === order.status);
-      const startTime = lastLog ? new Date(lastLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
-      const elapsedMs = Date.now() - startTime;
+      if (!limitHrs || limitHrs <= 0) return;
+      const startTime = getTechReviewStartTime(order);
+      const isStillInReview = [OrderStatus.LOGGED, OrderStatus.TECHNICAL_REVIEW, OrderStatus.NEGATIVE_MARGIN].includes(order.status);
+      const endTime = (!isStillInReview && order.technicalReviewFinishedAt)
+        ? new Date(order.technicalReviewFinishedAt).getTime()
+        : Date.now();
+      const elapsedMs = Math.max(0, endTime - startTime);
       setRemaining((limitHrs * 3600000) - elapsedMs);
     };
     calc();
     const timer = setInterval(calc, 60000);
     return () => clearInterval(timer);
-  }, [order.status, config.settings]);
+  }, [order.status, order.dataEntryTimestamp, order.technicalReviewStartedAt, order.technicalReviewFinishedAt, limitHrs]);
 
-  const limitHrs = order.status === OrderStatus.LOGGED ? config.settings.orderEditTimeLimitHrs : config.settings.technicalReviewLimitHrs;
-  if (limitHrs === 0) return null;
+  if (!limitHrs || limitHrs <= 0) return null;
 
+  const isStillInReview = [OrderStatus.LOGGED, OrderStatus.TECHNICAL_REVIEW, OrderStatus.NEGATIVE_MARGIN].includes(order.status);
   const isOver = remaining < 0;
   const absRemaining = Math.abs(remaining);
   const hrs = Math.floor(absRemaining / 3600000);
@@ -236,7 +241,10 @@ const ThresholdDisplay: React.FC<{ order: CustomerOrder, config: AppConfig }> = 
   return (
     <div className={`text-[10px] font-black uppercase flex items-center gap-1.5 ${isOver ? 'text-rose-500 animate-pulse' : 'text-emerald-500'}`}>
       <i className={`fa-solid ${isOver ? 'fa-clock-rotate-left' : 'fa-stopwatch'}`}></i>
-      {isOver ? `Over S.O.P limit by ${timeStr}` : `Targeted Finish: ${timeStr} remaining`}
+      {!isStillInReview
+        ? (isOver ? `Completed over S.O.P limit by ${timeStr}` : `Completed in S.O.P limit (${timeStr} remaining)`)
+        : (isOver ? `Over S.O.P limit by ${timeStr}` : `Targeted Finish: ${timeStr} remaining`)
+      }
     </div>
   );
 };
@@ -331,6 +339,20 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
     }
   };
 
+  const updateOrderInState = (updated: CustomerOrder, preferredItemId?: string) => {
+    setSelectedOrder(updated);
+    setOrders(prev => prev.map(o => o.id === updated.id ? updated : o));
+    const targetItemId = preferredItemId || selectedItem?.id;
+    if (targetItemId) {
+      const match = updated.items.find((i: any) => i.id === targetItemId);
+      if (match) {
+        setSelectedItem(match);
+      } else if (updated.items.length > 0) {
+        setSelectedItem(updated.items[0]);
+      }
+    }
+  };
+
   const allReviewableOrders = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
     return orders.filter(o => {
@@ -347,20 +369,24 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
     });
   }, [searchQuery, orders]);
 
+  const isOrderBlanket = (o: CustomerOrder) => {
+    return Boolean(o.blanketOrder || o.contractId || o.blanketContractId);
+  };
+
   const blanketOrdersCount = useMemo(() => {
-    return allReviewableOrders.filter(o => o.blanketOrder === true).length;
+    return allReviewableOrders.filter(o => isOrderBlanket(o)).length;
   }, [allReviewableOrders]);
 
   const nonBlanketOrdersCount = useMemo(() => {
-    return allReviewableOrders.filter(o => !o.blanketOrder).length;
+    return allReviewableOrders.filter(o => !isOrderBlanket(o)).length;
   }, [allReviewableOrders]);
 
   const queueOrders = useMemo(() => {
     let filtered = allReviewableOrders.filter(o => {
       if (manufactureSubTab === 'blanket') {
-        return o.blanketOrder === true;
+        return isOrderBlanket(o);
       } else {
-        return !o.blanketOrder;
+        return !isOrderBlanket(o);
       }
     });
 
@@ -543,8 +569,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
           inventoryItemId: inv.id,
           status: 'RESERVED'
         });
-        setSelectedOrder(updated);
-        setSelectedItem(updated.items.find(i => i.id === selectedItem.id)!);
+        updateOrderInState(updated);
       } else {
         // Partial stock or Out of stock
         let currentOrder = selectedOrder;
@@ -579,8 +604,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
           scopeOfWork: compScope || inv.description
         });
 
-        setSelectedOrder(finalOrder);
-        setSelectedItem(finalOrder.items.find(i => i.id === selectedItem.id)!);
+        updateOrderInState(finalOrder);
       }
 
       setCompSearch('');
@@ -625,8 +649,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
       scopeOfWork: compScope || part.description,
       status: 'PENDING_OFFER'
     });
-    setSelectedOrder(updated);
-    setSelectedItem(updated.items.find(i => i.id === selectedItem.id)!);
+    updateOrderInState(updated);
     setCompSearch('');
     setPartNumSearch('');
     setCompDurationVal('');
@@ -663,8 +686,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
       contractDuration: finalDuration,
       scopeOfWork: compScope || compSearch.trim()
     });
-    setSelectedOrder(updated);
-    setSelectedItem(updated.items.find(i => i.id === selectedItem.id)!);
+    updateOrderInState(updated);
     setCompSearch('');
     setPartNumSearch('');
     setCompDurationVal('');
@@ -690,8 +712,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
     setIsProcessing(true);
     try {
       const updated = await dataService.toggleItemAcceptance(selectedOrder.id, item.id);
-      setSelectedOrder(updated);
-      setSelectedItem(updated.items.find((i: any) => i.id === item.id) || null);
+      updateOrderInState(updated, item.id);
     } catch (e: any) {
       alert(e.message);
     } finally {
@@ -737,9 +758,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
       }
 
       const updatedOrder = await dataService.updateComponent(selectedOrder.id, selectedItem.id, editingComp.id, updates);
-      setSelectedOrder(updatedOrder);
-      const newItem = updatedOrder.items.find((i: any) => i.id === selectedItem.id);
-      if (newItem) setSelectedItem(newItem);
+      updateOrderInState(updatedOrder);
       setEditingComp(null);
     } catch (e: any) {
       alert(e.message);
@@ -860,7 +879,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
     const costInOrderCurrency = totalCost * rate;
     const marginAmt = totalRevenue - costInOrderCurrency;
     const markupPct = costInOrderCurrency > 0 ? (marginAmt / costInOrderCurrency) * 100 : (totalRevenue > 0 ? 100 : 0);
-    const isViolated = isMarginBreach(costInOrderCurrency, markupPct, config.settings.minimumMarginPct);
+    const isViolated = !isOrderBlanket(selectedOrder) && isMarginBreach(costInOrderCurrency, markupPct, config.settings.minimumMarginPct, isOrderBlanket(selectedOrder));
 
     return {
       revenue: totalRevenue,
@@ -1018,7 +1037,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                       </td>
                       <td className="px-8 py-6">
                         <div className="flex items-center gap-4 justify-end">
-                          {o.status === OrderStatus.NEGATIVE_MARGIN && (
+                          {o.status === OrderStatus.NEGATIVE_MARGIN && !isOrderBlanket(o) && (
                             <span className="px-2 py-0.5 bg-rose-600 text-white text-[8px] font-black uppercase rounded animate-pulse">Margin Breach</span>
                           )}
                           <div className="flex-1 max-w-[100px] h-2 bg-slate-100 rounded-full overflow-hidden">
@@ -1055,6 +1074,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                       <div className="text-[9px] font-bold text-slate-400 mt-0.5 uppercase flex items-center gap-2">
                         <span className="bg-slate-800 px-2 py-0.5 rounded leading-none">ID: {selectedOrder.internalOrderNumber}</span>
                         <span className="bg-slate-800 px-2 py-0.5 rounded leading-none">PO: {selectedOrder.customerReferenceNumber}</span>
+                        <span className="bg-slate-800 px-2.5 py-0.5 rounded leading-none"><ThresholdDisplay order={selectedOrder} config={config} /></span>
                         {selectedOrder.googleDriveLink && (
                           <a
                             href={selectedOrder.googleDriveLink}
@@ -1185,10 +1205,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                                 <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">Workflow Mode</h4>
                                 <div className="flex bg-slate-100 p-1 rounded-xl">
                                   <button
-                                    onClick={() => dataService.setProductionType(selectedOrder.id, selectedItem.id, 'TRADING').then(o => {
-                                      setSelectedOrder(o);
-                                      setSelectedItem(o.items.find(it => it.id === selectedItem.id)!);
-                                    })}
+                                    onClick={() => dataService.setProductionType(selectedOrder.id, selectedItem.id, 'TRADING').then(o => updateOrderInState(o))}
                                     className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase transition-all ${selectedItem.productionType === 'TRADING' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
                                   >
                                     <i className="fa-solid fa-cart-shopping mr-2"></i> Trading
@@ -1198,10 +1215,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                                       if (selectedItem.productionType === 'TRADING' && selectedItem.components?.length) {
                                         if (!confirm("Switching to Outsourcing will remove the automatically generated mirror component. Continue?")) return;
                                       }
-                                      dataService.setProductionType(selectedOrder.id, selectedItem.id, 'OUTSOURCING').then(o => {
-                                        setSelectedOrder(o);
-                                        setSelectedItem(o.items.find(it => it.id === selectedItem.id)!);
-                                      });
+                                      dataService.setProductionType(selectedOrder.id, selectedItem.id, 'OUTSOURCING').then(o => updateOrderInState(o));
                                     }}
                                     className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase transition-all ${selectedItem.productionType === 'OUTSOURCING' ? 'bg-white text-violet-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
                                   >
@@ -1212,10 +1226,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                                       if (selectedItem.productionType === 'TRADING' && selectedItem.components?.length) {
                                         if (!confirm("Switching to Manufacturing will remove the automatically generated mirror component. Continue?")) return;
                                       }
-                                      dataService.setProductionType(selectedOrder.id, selectedItem.id, 'MANUFACTURING').then(o => {
-                                        setSelectedOrder(o);
-                                        setSelectedItem(o.items.find(it => it.id === selectedItem.id)!);
-                                      });
+                                      dataService.setProductionType(selectedOrder.id, selectedItem.id, 'MANUFACTURING').then(o => updateOrderInState(o));
                                     }}
                                     className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase transition-all ${selectedItem.productionType === 'MANUFACTURING' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
                                   >
@@ -1293,9 +1304,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                                             try {
                                               setIsProcessing(true);
                                               const updated = await dataService.uploadCostSheet(selectedOrder.id, selectedItem.id, result, file.name);
-                                              setSelectedOrder(updated);
-                                              const updatedItem = updated.items.find(i => i.id === selectedItem.id);
-                                              if (updatedItem) setSelectedItem(updatedItem);
+                                              updateOrderInState(updated);
                                             } catch (err: any) {
                                               alert(err.message || 'Failed to upload cost sheet');
                                             } finally {
@@ -1313,9 +1322,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                                           try {
                                             setIsProcessing(true);
                                             const updated = await dataService.uploadCostSheet(selectedOrder.id, selectedItem.id, null, null);
-                                            setSelectedOrder(updated);
-                                            const updatedItem = updated.items.find(i => i.id === selectedItem.id);
-                                            if (updatedItem) setSelectedItem(updatedItem);
+                                            updateOrderInState(updated);
                                           } catch (err: any) {
                                             alert(err.message || 'Failed to remove cost sheet');
                                           } finally {
@@ -1606,7 +1613,7 @@ export const TechnicalReviewModule: React.FC<TechnicalReviewModuleProps> = ({ co
                                         <i className="fa-solid fa-pen-to-square"></i>
                                       </button>
                                       <button
-                                        onClick={() => dataService.removeComponent(selectedOrder.id, selectedItem.id, c.id).then(o => { setSelectedOrder(o); setSelectedItem(o.items.find(it => it.id === selectedItem.id)!); })}
+                                        onClick={() => dataService.removeComponent(selectedOrder.id, selectedItem.id, c.id).then(o => updateOrderInState(o))}
                                         className="p-2 text-slate-300 hover:text-rose-500 transition-colors"
                                       >
                                         <i className="fa-solid fa-trash-can"></i>

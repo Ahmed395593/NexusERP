@@ -160,14 +160,16 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
   const [activeTab, setActiveTab] = useState<ManagementTab>('new');
   const [contracts, setContracts] = useState<any[]>([]);
   const [contractId, setContractId] = useState('');
-  const [blanketSubTab, setBlanketSubTab] = useState<'new_blanket' | 'new_contract' | 'logged_contracts'>('new_blanket');
+  const [blanketSubTab, setBlanketSubTab] = useState<'new_blanket' | 'new_contract' | 'logged_contracts' | 'logged_blanket'>('new_blanket');
   const [contractFormId, setContractFormId] = useState('');
   const [contractFormCustomerName, setContractFormCustomerName] = useState('');
   const [contractFormDescription, setContractFormDescription] = useState('');
   const [contractFormTargetItems, setContractFormTargetItems] = useState('');
   const [contractFormReceivedDate, setContractFormReceivedDate] = useState(today);
   const [contractSearch, setContractSearch] = useState('');
+  const [blanketOrdersSearch, setBlanketOrdersSearch] = useState('');
   const [loggedOrdersSearch, setLoggedOrdersSearch] = useState('');
+  const [loggedFilterType, setLoggedFilterType] = useState<'all' | 'standard' | 'blanket'>('all');
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [existingOrders, setExistingOrders] = useState<CustomerOrder[]>([]);
   const [customerName, setCustomerName] = useState('');
@@ -198,6 +200,10 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' }>({ key: 'orderDate', direction: 'asc' });
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const isOrderBlanket = (order: CustomerOrder): boolean => {
+    return !!(order.blanketOrder || order.contractId || order.blanketContractId);
+  };
 
   // Delivery Note PDF & POD State moved to ShipmentModule
 
@@ -285,8 +291,43 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
     return submitLog?.user || 'System';
   };
 
+  const loggedStats = useMemo(() => {
+    const total = loggedOrders.length;
+    const blanket = loggedOrders.filter(o => isOrderBlanket(o)).length;
+    const standard = total - blanket;
+    return { total, blanket, standard };
+  }, [loggedOrders]);
+
+  const loggedBlanketOrders = useMemo(() => {
+    return loggedOrders.filter(o => isOrderBlanket(o));
+  }, [loggedOrders]);
+
+  const filteredLoggedBlanketOrders = useMemo(() => {
+    if (!blanketOrdersSearch.trim()) return loggedBlanketOrders;
+    const q = blanketOrdersSearch.toLowerCase().trim();
+    return loggedBlanketOrders.filter(order => {
+      const internalRef = (order.internalOrderNumber || '').toLowerCase();
+      const poRef = (order.customerReferenceNumber || '').toLowerCase();
+      const customer = (order.customerName || '').toLowerCase();
+      const contract = (order.contractId || order.blanketContractId || '').toLowerCase();
+      const project = (order.projectName || '').toLowerCase();
+      if (internalRef.includes(q) || poRef.includes(q) || customer.includes(q) || contract.includes(q) || project.includes(q)) return true;
+      for (const item of (order.items || [])) {
+        if ((item.description || '').toLowerCase().includes(q)) return true;
+      }
+      return false;
+    });
+  }, [loggedBlanketOrders, blanketOrdersSearch]);
+
   const filteredLoggedOrders = useMemo(() => {
-    if (!loggedOrdersSearch.trim()) return loggedOrders;
+    let base = loggedOrders;
+    if (loggedFilterType === 'standard') {
+      base = base.filter(o => !isOrderBlanket(o));
+    } else if (loggedFilterType === 'blanket') {
+      base = base.filter(o => isOrderBlanket(o));
+    }
+
+    if (!loggedOrdersSearch.trim()) return base;
     const q = loggedOrdersSearch.toLowerCase().trim();
 
     return loggedOrders.filter(order => {
@@ -371,10 +412,6 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
   useEffect(() => {
     if (!editingOrderId) lastAutoLoadedRef.current = null;
   }, [editingOrderId]);
-
-  const isOrderBlanket = (order: CustomerOrder): boolean => {
-    return !!order.blanketOrder;
-  };
 
   const getOrderContractId = (order: CustomerOrder): string => {
     if (order.contractId) return order.contractId;
@@ -1101,7 +1138,7 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
     setCustomerName(''); setCustomerReferenceNumber(''); setOrderDate(today);
     setPaymentSlaDays(config.settings.defaultPaymentSlaDays);
     setAppliesWithholdingTax(false);
-    setBlanketOrder(false);
+    setBlanketOrder(activeTab === 'blanket');
     setProjectName('');
     setBlanketContractId('');
     setContractId('');
@@ -1580,6 +1617,12 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
             className={`px-6 py-2 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${blanketSubTab === 'logged_contracts' ? 'bg-white text-teal-600 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
           >
             Logged Contracts
+          </button>
+          <button
+            onClick={() => setBlanketSubTab('logged_blanket')}
+            className={`px-6 py-2 rounded-lg text-xs font-black uppercase tracking-widest transition-all flex items-center gap-1.5 ${blanketSubTab === 'logged_blanket' ? 'bg-white text-teal-600 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+          >
+            <i className="fa-solid fa-layer-group text-[10px]"></i> Logged Blanket Orders ({loggedStats.blanket})
           </button>
         </div>
       )}
@@ -2092,6 +2135,120 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
             </div>
           </div>
         </div>
+      ) : (activeTab === 'blanket' && blanketSubTab === 'logged_blanket') ? (
+        <div className="animate-in fade-in duration-500">
+          <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden min-h-[50vh]">
+            <div className="p-6 bg-slate-50 border-b flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-teal-600 flex items-center justify-center text-white shadow-lg">
+                  <i className="fa-solid fa-layer-group text-xl"></i>
+                </div>
+                <div>
+                  <h2 className="text-xl font-black text-slate-800 uppercase tracking-tight">Logged Blanket Orders</h2>
+                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">Manage and resume uncommitted blanket orders and contracts</p>
+                </div>
+              </div>
+              {/* Search Box */}
+              <div className="relative w-full md:w-80">
+                <input
+                  type="text"
+                  className="w-full pl-10 pr-8 py-2 border-2 border-slate-100 rounded-xl bg-slate-50 text-xs font-bold outline-none focus:bg-white focus:border-teal-500 transition-all shadow-inner"
+                  placeholder="Search PO, customer, contract, items..."
+                  value={blanketOrdersSearch}
+                  onChange={e => setBlanketOrdersSearch(e.target.value)}
+                />
+                <i className="fa-solid fa-magnifying-glass absolute left-3.5 top-3 text-slate-400 text-xs"></i>
+                {blanketOrdersSearch && (
+                  <button
+                    onClick={() => setBlanketOrdersSearch('')}
+                    className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 text-xs transition-colors"
+                    title="Clear search"
+                  >
+                    <i className="fa-solid fa-xmark"></i>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead className="bg-slate-50/50 border-b border-slate-100 text-[10px] font-black uppercase text-slate-400 tracking-widest">
+                  <tr>
+                    <th className="px-8 py-5">Internal Ref / PO Ref</th>
+                    <th className="px-8 py-5">Contract ID</th>
+                    <th className="px-8 py-5">PO Received</th>
+                    <th className="px-8 py-5">Submitted Into System</th>
+                    <th className="px-8 py-5">Customer Entity</th>
+                    <th className="px-8 py-5">Lines</th>
+                    <th className="px-8 py-5 text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {filteredLoggedBlanketOrders.map(draft => (
+                    <tr key={draft.id} className="hover:bg-teal-50/40 transition-all group">
+                      <td className="px-8 py-6">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs font-black text-teal-700 uppercase">{draft.internalOrderNumber}</span>
+                          <span className="text-[9px] font-black text-teal-700 bg-teal-50 px-1.5 py-0.5 rounded border border-teal-200 uppercase tracking-wider">
+                            <i className="fa-solid fa-layer-group text-[8px] mr-1"></i>Blanket
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-bold uppercase mt-1">PO: {draft.customerReferenceNumber || 'N/A'}</div>
+                        {draft.projectName && (
+                          <div className="text-[9px] text-slate-400 font-medium mt-0.5">Project: {draft.projectName}</div>
+                        )}
+                        {draft.loggingComplianceViolation && <div className="mt-1"><span className="text-[9px] font-black text-rose-600 bg-rose-100 px-1.5 py-0.5 rounded border border-rose-200 uppercase tracking-wider">Logging Delay</span></div>}
+                        {draft.status === OrderStatus.NEGATIVE_MARGIN && <div className="mt-1"><span className="text-[9px] font-black text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded border border-rose-300 uppercase tracking-wider">Negative Margin</span></div>}
+                      </td>
+                      <td className="px-8 py-6">
+                        {draft.contractId || draft.blanketContractId ? (
+                          <span className="font-mono text-xs font-black text-teal-600 bg-teal-50 px-2 py-1 rounded-lg border border-teal-200">
+                            {draft.contractId || draft.blanketContractId}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-slate-400 italic">No Contract ID</span>
+                        )}
+                      </td>
+                      <td className="px-8 py-6 text-xs text-slate-700 font-black">
+                        {draft.orderDate ? new Date(draft.orderDate).toLocaleDateString() : 'N/A'}
+                      </td>
+                      <td className="px-8 py-6 text-[10px] text-slate-500 font-bold uppercase">
+                        {formatOrderTimestamp(draft.dataEntryTimestamp)}
+                        <div className="text-[8px] opacity-60 normal-case">by {getSubmittedBy(draft)}</div>
+                      </td>
+                      <td className="px-8 py-6 font-black text-slate-800">{draft.customerName}</td>
+                      <td className="px-8 py-6">
+                        <span className="px-2.5 py-1 bg-slate-100 rounded-lg text-[10px] font-black text-slate-600 border border-slate-200">
+                          {draft.items.length} POS
+                        </span>
+                      </td>
+                      <td className="px-8 py-6 text-right">
+                        <button
+                          onClick={() => loadOrder(draft)}
+                          className="px-5 py-2.5 bg-teal-600 text-white font-black text-[10px] uppercase rounded-xl hover:bg-teal-700 transition-all shadow-lg shadow-teal-100 flex items-center gap-2 ml-auto cursor-pointer"
+                        >
+                          <i className="fa-solid fa-rotate-right"></i> Resume Record
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {filteredLoggedBlanketOrders.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="px-8 py-20 text-center">
+                        <div className="flex flex-col items-center gap-3 text-slate-300">
+                          <i className="fa-solid fa-layer-group text-5xl opacity-10"></i>
+                          <p className="font-black text-xs uppercase tracking-[0.2em]">
+                            {blanketOrdersSearch ? `No matching logged blanket orders found for "${blanketOrdersSearch}"` : 'No Active Logged Blanket Orders Found'}
+                          </p>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
       ) : activeTab === 'logged' ? (
         <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
           <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
@@ -2105,25 +2262,66 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
                   <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">Manage and resume uncommitted operational records</p>
                 </div>
               </div>
-              {/* Search Box */}
-              <div className="relative w-full md:w-80">
-                <input
-                  type="text"
-                  className="w-full pl-10 pr-8 py-2 border-2 border-slate-200 rounded-xl bg-white text-xs font-bold outline-none focus:border-blue-500 transition-all shadow-inner"
-                  placeholder="Search PO, internal ref, customer, dates, user..."
-                  value={loggedOrdersSearch}
-                  onChange={e => setLoggedOrdersSearch(e.target.value)}
-                />
-                <i className="fa-solid fa-magnifying-glass absolute left-3.5 top-3 text-slate-400 text-xs"></i>
-                {loggedOrdersSearch && (
+              <div className="flex items-center gap-3 flex-wrap">
+                {/* Filter Pills */}
+                <div className="flex items-center gap-1 bg-slate-200/80 p-1 rounded-xl">
                   <button
-                    onClick={() => setLoggedOrdersSearch('')}
-                    className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 text-xs transition-colors"
-                    title="Clear search"
+                    type="button"
+                    onClick={() => setLoggedFilterType('all')}
+                    className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer ${
+                      loggedFilterType === 'all'
+                        ? 'bg-white text-slate-800 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-800'
+                    }`}
                   >
-                    <i className="fa-solid fa-xmark"></i>
+                    All ({loggedStats.total})
                   </button>
-                )}
+                  <button
+                    type="button"
+                    onClick={() => setLoggedFilterType('standard')}
+                    className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 cursor-pointer ${
+                      loggedFilterType === 'standard'
+                        ? 'bg-blue-600 text-white shadow-sm'
+                        : 'text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <i className="fa-solid fa-box text-[9px]"></i>
+                    Standard ({loggedStats.standard})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLoggedFilterType('blanket')}
+                    className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 cursor-pointer ${
+                      loggedFilterType === 'blanket'
+                        ? 'bg-teal-600 text-white shadow-sm'
+                        : 'text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    <i className="fa-solid fa-layer-group text-[9px]"></i>
+                    Blanket ({loggedStats.blanket})
+                  </button>
+                </div>
+
+                {/* Search Box */}
+                <div className="relative w-full md:w-80">
+                  <input
+                    type="text"
+                    className="w-full pl-10 pr-8 py-2 border-2 border-slate-200 rounded-xl bg-white text-xs font-bold outline-none focus:border-blue-500 transition-all shadow-inner"
+                    placeholder="Search PO, internal ref, customer, dates, user..."
+                    value={loggedOrdersSearch}
+                    onChange={e => setLoggedOrdersSearch(e.target.value)}
+                  />
+                  <i className="fa-solid fa-magnifying-glass absolute left-3.5 top-3 text-slate-400 text-xs"></i>
+                  {loggedOrdersSearch && (
+                    <button
+                      onClick={() => setLoggedOrdersSearch('')}
+                      className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 text-xs transition-colors"
+                      title="Clear search"
+                    >
+                      <i className="fa-solid fa-xmark"></i>
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
             <div className="overflow-x-auto">
@@ -2160,7 +2358,7 @@ export const OrderManagement: React.FC<OrderManagementProps> = ({ config, refres
                       <td className="px-8 py-6">
                         <div className="flex items-center gap-2">
                           <span className="font-mono text-xs font-black text-blue-600 uppercase">{draft.internalOrderNumber}</span>
-                          {draft.blanketOrder ? (
+                          {isOrderBlanket(draft) ? (
                             <span className="text-[9px] font-black text-teal-700 bg-teal-50 px-1.5 py-0.5 rounded border border-teal-200 uppercase tracking-wider">
                               <i className="fa-solid fa-layer-group text-[8px] mr-1"></i>Blanket
                             </span>

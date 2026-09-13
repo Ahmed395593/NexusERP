@@ -301,7 +301,7 @@ const App: React.FC = () => {
       return acc;
     }, {} as Record<string, { count: number, hasOverdue: boolean, hasViolation: boolean }>);
 
-    const negativeMarginOrders = orders.filter(o => o.status === OrderStatus.NEGATIVE_MARGIN);
+    const negativeMarginOrders = orders.filter(o => o.status === OrderStatus.NEGATIVE_MARGIN && !o.blanketOrder && !o.contractId && !o.blanketContractId);
 
     return {
       totalRevenue,
@@ -314,7 +314,7 @@ const App: React.FC = () => {
       marginPct: totalRevenue > 0 ? ((totalRevenue - totalCost) / totalRevenue) * 100 : 0,
       statusCounts,
       negativeMarginOrders,
-      riskCount: orders.filter(o => o.status === OrderStatus.NEGATIVE_MARGIN || o.status === OrderStatus.IN_HOLD).length
+      riskCount: orders.filter(o => (o.status === OrderStatus.NEGATIVE_MARGIN && !o.blanketOrder && !o.contractId && !o.blanketContractId) || o.status === OrderStatus.IN_HOLD).length
     };
   }, [orders, config.settings]);
 

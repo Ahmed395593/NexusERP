@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { dataService } from '../services/dataService';
 import { CustomerOrder, Customer, Supplier, OrderStatus, AppConfig, User, getItemEffectiveStatus } from '../types';
-import { getItemEffectiveQty, getOrderConversionRate, getOrderCurrency, getStatusLimitHours } from '../utils';
+import { getItemEffectiveQty, getOrderConversionRate, getOrderCurrency, getStatusLimitHours, getTechReviewStartTime } from '../utils';
 import { isMarginBreach } from '../shared/margin';
 import { STATUS_CONFIG, getDynamicOrderStatusStyle } from '../constants';
 import { jsPDF } from 'jspdf';
@@ -63,7 +63,9 @@ const ThresholdSentinel: React.FC<{ order: CustomerOrder, config: AppConfig }> =
       const limitHrs = getStatusLimit(order, config.settings);
       if (limitHrs === 0) return;
       const lastLog = [...order.logs].reverse().find(l => l.status === order.status);
-      const startTime = lastLog ? new Date(lastLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime();
+      const startTime = order.status === OrderStatus.TECHNICAL_REVIEW
+        ? getTechReviewStartTime(order)
+        : (lastLog ? new Date(lastLog.timestamp).getTime() : new Date(order.dataEntryTimestamp).getTime());
       const elapsedMs = Date.now() - startTime;
       setRemaining((limitHrs * 3600000) - elapsedMs);
     };
@@ -1632,11 +1634,11 @@ const FinanceModuleInner: React.FC<FinanceModuleProps> = ({ config, refreshKey, 
               })
               .filter(x => x.hasBalance)
               .map(({ customer, projects, customerTotal }) => (
-                <div key={customer.id} className="border border-slate-200 rounded-3xl overflow-hidden">
+                <div key={customer.id} className={`border rounded-3xl overflow-hidden ${customerTotal < 0 ? 'border-rose-200' : 'border-slate-200'}`}>
                   {/* Customer header */}
-                  <div className="flex items-center justify-between gap-4 px-6 py-4 bg-slate-900">
+                  <div className={`flex items-center justify-between gap-4 px-6 py-4 ${customerTotal < 0 ? 'bg-rose-900' : 'bg-slate-900'}`}>
                     <div className="flex items-center gap-3 min-w-0">
-                      <div className="w-9 h-9 rounded-xl bg-emerald-500/20 text-emerald-300 flex items-center justify-center shrink-0">
+                      <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${customerTotal < 0 ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/20 text-emerald-300'}`}>
                         <i className="fa-solid fa-building"></i>
                       </div>
                       <div className="min-w-0">
@@ -1645,8 +1647,13 @@ const FinanceModuleInner: React.FC<FinanceModuleProps> = ({ config, refreshKey, 
                       </div>
                     </div>
                     <div className="text-end shrink-0">
-                      <div className="text-[9px] font-black uppercase text-slate-400 tracking-widest">Total Wallet</div>
-                      <div className="text-lg font-black text-emerald-400">{customerTotal.toLocaleString()} L.E.</div>
+                      <div className="text-[9px] font-black uppercase text-slate-400 tracking-widest">
+                        {customerTotal < 0 ? 'Total Debt' : 'Total Wallet'}
+                      </div>
+                      <div className={`text-lg font-black ${customerTotal < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                        {customerTotal.toLocaleString()} L.E.
+                        {customerTotal < 0 && <span className="text-[9px] font-black ml-1.5 opacity-70 uppercase tracking-wider">(Debt)</span>}
+                      </div>
                     </div>
                   </div>
 {/* Nested project rows */}
@@ -1665,22 +1672,34 @@ const FinanceModuleInner: React.FC<FinanceModuleProps> = ({ config, refreshKey, 
                       </thead>
                       <tbody className="divide-y divide-slate-50">
                         {projects.map(({ project, balance }) => (
-                          <tr key={project} className="hover:bg-slate-50/80 transition-colors">
+                          <tr key={project} className={`transition-colors ${balance < 0 ? 'hover:bg-rose-50/60 bg-rose-50/30' : 'hover:bg-slate-50/80'}`}>
                             <td className="px-6 py-4">
                               <div className="flex items-center gap-2.5">
-                                <i className="fa-solid fa-diagram-project text-slate-300"></i>
+                                <i className={`fa-solid fa-diagram-project ${balance < 0 ? 'text-rose-300' : 'text-slate-300'}`}></i>
                                 <span className="font-bold text-slate-700 text-sm">{project}</span>
                               </div>
                             </td>
                             <td className="px-6 py-4 text-end">
-                              <span className={`inline-flex items-center gap-2 text-sm font-black px-4 py-2 rounded-xl border ${balance > 0 ? 'text-emerald-700 bg-emerald-50 border-emerald-200' : 'text-slate-500 bg-slate-50 border-slate-200'}`}>
-                                <i className={`fa-solid fa-wallet ${balance > 0 ? 'text-emerald-500' : 'text-slate-400'}`}></i>
+                              <span className={`inline-flex items-center gap-2 text-sm font-black px-4 py-2 rounded-xl border ${
+                                balance > 0
+                                  ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+                                  : balance < 0
+                                  ? 'text-rose-700 bg-rose-50 border-rose-200'
+                                  : 'text-slate-500 bg-slate-50 border-slate-200'
+                              }`}>
+                                <i className={`fa-solid fa-wallet ${balance > 0 ? 'text-emerald-500' : balance < 0 ? 'text-rose-500' : 'text-slate-400'}`}></i>
                                 {balance.toLocaleString()} L.E.
                               </span>
                             </td>
                             <td className="px-6 py-4">
-                              <span className={`px-2.5 py-1 rounded-lg text-[9px] font-black uppercase border ${balance > 0 ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
-                                {balance > 0 ? 'Credit Available' : 'No Credit'}
+                              <span className={`px-2.5 py-1 rounded-lg text-[9px] font-black uppercase border ${
+                                balance > 0
+                                  ? 'bg-emerald-50 text-emerald-600 border-emerald-100'
+                                  : balance < 0
+                                  ? 'bg-rose-50 text-rose-600 border-rose-200'
+                                  : 'bg-slate-100 text-slate-500 border-slate-200'
+                              }`}>
+                                {balance > 0 ? 'Credit Available' : balance < 0 ? 'Debt / Uninvoiced' : 'Zero Balance'}
                               </span>
                             </td>
                           </tr>
@@ -2239,7 +2258,8 @@ const FinanceModuleInner: React.FC<FinanceModuleProps> = ({ config, refreshKey, 
               </>
             ) : filteredOrders.map((o, orderIdx) => {
               const pl = (o as any).pl;
-              const isBreach = isMarginBreach(pl.costInOrderCurrency ?? pl.cost, pl.markupPct, config.settings.minimumMarginPct);
+              const isBlanketOrder = !!(o.blanketOrder || o.contractId || o.blanketContractId);
+              const isBreach = !isBlanketOrder && isMarginBreach(pl.costInOrderCurrency ?? pl.cost, pl.markupPct, config.settings.minimumMarginPct);
               const currentTab = activeTab as string;
               const showRow = currentTab === 'orders' ||
                 (currentTab === 'billing_details' && ([OrderStatus.IN_PRODUCT_HUB, OrderStatus.ISSUE_INVOICE].includes(o.status) || o.items.some(i => (i.hubReceivedQty || 0) > (i.approvedForDispatchQty || 0)))) ||

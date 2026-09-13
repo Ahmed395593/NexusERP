@@ -451,6 +451,7 @@ export const StudyingModule: React.FC<StudyingModuleProps> = ({ currentUser, con
                     onClick={async () => {
                       const updated = await dataService.toggleItemAcceptance(selectedOrder.id, selectedItem.id);
                       setSelectedOrder(updated);
+                      setAllOrders(prev => prev.map(o => o.id === updated.id ? updated : o));
                       setSelectedItem(updated.items.find(i => i.id === selectedItem.id)!);
                     }}
                     className={`px-8 py-3 rounded-xl font-black uppercase text-xs transition-all flex items-center gap-2 shadow-lg ${selectedItem.isAccepted ? 'bg-red-50 text-red-600 hover:bg-red-100 shadow-red-100' : 'bg-green-600 text-white hover:bg-green-700 shadow-green-100'}`}

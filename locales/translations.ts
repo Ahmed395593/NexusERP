@@ -196,6 +196,11 @@ export const translations: Record<string, any> = {
       rollback: {
         title: 'Order Workflow Rollback', executeRollback: 'Execute Rollback', revertingToLogged: 'Reverting to Logged Registry',
         warningRollback: 'Strategic Action: Reverting this entire order will move it back to the "Logged Registry". This should only be used to correct major entry errors.',
+        targetClassification: 'Target Order Classification in Logged Registry',
+        standardOrder: 'Standard Order',
+        standardOrderDesc: 'Returns to Logged Standard Orders (resumes in New Orders form)',
+        blanketOrder: 'Blanket Order',
+        blanketOrderDesc: 'Returns to Logged Blanket Orders (resumes in Blanket Orders module)',
       },
       cancelPO: {
         title: 'Cancelling PO', affectedComponents: 'Affected Components',
@@ -448,6 +453,11 @@ export const translations: Record<string, any> = {
       rollback: {
         title: 'تراجع عن سير عمل الطلب', executeRollback: 'تنفيذ التراجع', revertingToLogged: 'الإرجاع إلى السجل المسجل',
         warningRollback: 'إجراء استراتيجي: إرجاع هذا الطلب بالكامل إلى "السجل المسجل". يجب استخدام هذا فقط لتصحيح أخطاء إدخال كبيرة.',
+        targetClassification: 'تصنيف الطلب المستهدف في سجل المسجل',
+        standardOrder: 'طلب قياسي / عادي',
+        standardOrderDesc: 'يعود إلى سجل الطلبات القياسية المسجلة (يُستأنف في نموذج الطلبات الجديدة)',
+        blanketOrder: 'طلب شامل / عقد توريد',
+        blanketOrderDesc: 'يعود إلى سجل الطلبات الشاملة المسجلة (يُستأنف في وحدة الطلبات الشاملة)',
       },
       cancelPO: {
         title: 'إلغاء أمر الشراء', affectedComponents: 'المكونات المتأثرة',

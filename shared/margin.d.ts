@@ -1,1 +1,1 @@
-export declare function isMarginBreach(cost: number, markupPct: number, minMargin: number): boolean;
+export declare function isMarginBreach(cost: number, markupPct: number, minMargin: number, isBlanket?: boolean): boolean;

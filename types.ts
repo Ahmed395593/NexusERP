@@ -382,6 +382,8 @@ export interface CustomerOrder {
    */
   isSettlingOrder?: boolean;
   contractId?: string;
+  technicalReviewStartedAt?: string;
+  technicalReviewFinishedAt?: string;
 }
 
 export interface Contract {
